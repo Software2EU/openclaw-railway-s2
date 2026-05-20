@@ -36,6 +36,12 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV BUN_INSTALL="/home/openclaw/.bun"
 ENV PATH="/home/openclaw/.bun/bin:${PATH}"
 
+# === S2: Install GBrain CLI ===
+RUN git clone --depth 1 https://github.com/garrytan/gbrain.git /home/openclaw/gbrain \
+    && cd /home/openclaw/gbrain \
+    && bun install --ignore-scripts \
+    && bun link
+
 # === S2: Install GStack + Playwright ===
 RUN git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git /home/openclaw/gstack \
     && cd /home/openclaw/gstack \
