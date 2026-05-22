@@ -47,7 +47,6 @@ RUN git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git /
     && cd /home/openclaw/gstack \
     && bun install --ignore-scripts \
     && ./setup \
-    && bunx playwright install chromium
 
 # Build browse binary (non-fatal if it fails)
 RUN cd /home/openclaw/gstack && bun run build 2>/dev/null || true
