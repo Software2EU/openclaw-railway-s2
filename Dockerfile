@@ -42,11 +42,11 @@ RUN git clone --depth 1 https://github.com/garrytan/gbrain.git /home/openclaw/gb
     && bun install --ignore-scripts \
     && bun link
 
-# === S2: Install GStack + Playwright + Setup ===
 RUN git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git /home/openclaw/gstack \
     && cd /home/openclaw/gstack \
     && bun install --ignore-scripts \
-    && ./setup \
+    && mkdir -p /home/openclaw/.claude/skills \
+    && cp -R /home/openclaw/gstack /home/openclaw/.claude/skills/gstack
 
 # Build browse binary (non-fatal if it fails)
 RUN cd /home/openclaw/gstack && bun run build 2>/dev/null || true
