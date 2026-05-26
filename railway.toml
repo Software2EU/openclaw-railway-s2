@@ -2,7 +2,7 @@
 builder = "dockerfile"
 
 [deploy]
-healthcheckPath = ""
+healthcheckPath = "/setup/healthz"
 healthcheckTimeout = 10000
 restartPolicyType = "on_failure"
 
