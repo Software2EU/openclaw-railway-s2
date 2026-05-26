@@ -30,8 +30,10 @@ RUN mkdir -p /openclaw \
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
+
+# pnpm 11 requires allowBuilds in pnpm-workspace.yaml (not package.json, not CLI flags)
 RUN corepack enable \
-    && echo '{"onlyBuiltDependencies":["node-pty"]}' > .pnpm-allowedBuilds.json \
+    && printf 'allowBuilds:\n  node-pty: true\n' > pnpm-workspace.yaml \
     && pnpm install --frozen-lockfile --prod
 
 COPY src ./src
