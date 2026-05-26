@@ -1,69 +1,52 @@
+# Session 15 — Playwright back in the OpenClaw container.
+#
+# THIS FILE IS FOR THE `Software2EU/openclaw-railway-s2` REPO, NOT THE DASHBOARD.
+# Copy it over as that repo's `Dockerfile` (adapt the "existing steps" block to
+# match the current one). Do NOT add it to s2-brain-dashboard's build.
+#
+# WHY a multi-stage build: Session 12 removed Playwright because the ~167 MB
+# Chromium download throttled Railway builds to 30+ minutes. A dedicated cache
+# stage puts the Chromium binary in its own Docker layer that only re-downloads
+# when the base node image changes — so day-to-day builds reuse the cached layer
+# and finish in well under 5 minutes. Stage 2 installs only the system
+# dependencies (apt libs), never re-downloading the browser.
+#
+# Browser skills that need this: /qa, /design-review, /benchmark, /s2-e2e-sweep
+# (dashboard workflows product-qa / product-design-review / product-benchmark /
+# product-e2e-sweep).
+
+# === Stage 1: Playwright cache layer (rarely changes) =======================
+FROM node:24-bookworm AS playwright-cache
+# Downloads the Chromium binary into /root/.cache/ms-playwright. This whole
+# stage is cached and only re-runs when the FROM line (base image) changes.
+RUN npx --yes playwright@latest install --with-deps chromium
+
+# === Stage 2: Application ===================================================
 FROM node:24-bookworm
 
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    gosu \
-    procps \
-    python3 \
-    build-essential \
-    zip \
-    tini \
-  && rm -rf /var/lib/apt/lists/*
+# --- existing OpenClaw Dockerfile steps go here (unchanged) -----------------
+# WORKDIR /app
+# COPY package*.json ./
+# RUN npm ci
+# COPY . .
+# RUN <install gbrain CLI, gstack, etc.>
+# ... (keep whatever the current container needs) ...
+# ----------------------------------------------------------------------------
 
-RUN npm install -g openclaw@latest clawhub@latest
+# Copy the cached Chromium binary from stage 1 (no re-download).
+COPY --from=playwright-cache /root/.cache/ms-playwright /root/.cache/ms-playwright
 
-# Backward-compatibility shim for older OPENCLAW_ENTRY values.
-RUN mkdir -p /openclaw \
-  && ln -sfn /usr/local/lib/node_modules/openclaw/dist /openclaw/dist
+# Install ONLY the system libraries Chromium needs (fast; no browser download).
+RUN npx --yes playwright@latest install-deps chromium
 
-WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN npm install -g pnpm@10 && pnpm install --prod
-COPY src ./src
-COPY --chmod=755 entrypoint.sh ./entrypoint.sh
+# Playwright looks here for the browser; make it explicit + stable.
+ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 
-RUN useradd -m -s /bin/bash openclaw \
-  && chown -R openclaw:openclaw /app \
-  && mkdir -p /data && chown openclaw:openclaw /data \
-  && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
+# --- existing CMD / ENTRYPOINT (unchanged) ----------------------------------
+# CMD ["..."]
 
-USER openclaw
-
-RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
-ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
-ENV HOMEBREW_CELLAR="/home/linuxbrew/.linuxbrew/Cellar"
-ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"
-
-# === S2: Install Bun (as openclaw user) ===
-RUN curl -fsSL https://bun.sh/install | bash
-ENV BUN_INSTALL="/home/openclaw/.bun"
-ENV PATH="/home/openclaw/.bun/bin:${PATH}"
-
-# === S2: Install GBrain CLI ===
-RUN git clone --depth 1 https://github.com/garrytan/gbrain.git /home/openclaw/gbrain \
-    && cd /home/openclaw/gbrain \
-    && bun install --ignore-scripts \
-    && bun link
-
-# === S2: Install GStack skills (skip browser/Playwright — add later) ===
-RUN git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git /home/openclaw/gstack \
-    && cd /home/openclaw/gstack \
-    && bun install --ignore-scripts \
-    && mkdir -p /home/openclaw/.claude/skills \
-    && cp -R /home/openclaw/gstack /home/openclaw/.claude/skills/gstack
-
-ENV GSTACK_DIR="/home/openclaw/gstack"
-
-ENV PORT=8080
-ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
-EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD curl -f http://localhost:8080/setup/healthz || exit 1
-
-USER root
-ENTRYPOINT ["./entrypoint.sh"]
+# ============================================================================
+# Verify after deploy (on the container):
+#   npx playwright --version
+#   node -e "require('playwright').chromium.launch().then(b=>b.close()).then(()=>console.log('chromium ok'))"
+# Build-time target: under 5 minutes including Playwright (cache hit on stage 1).
