@@ -49,6 +49,10 @@ RUN mkdir -p /home/openclaw/.cache/ms-playwright \
     && cp -R /root/.cache/ms-playwright/* /home/openclaw/.cache/ms-playwright/ \
     && chown -R openclaw:openclaw /home/openclaw/.cache/ms-playwright
 
+# Pre-create Homebrew cache dir so brew install doesn't fail on permissions
+RUN mkdir -p /home/openclaw/.cache/Homebrew \
+    && chown -R openclaw:openclaw /home/openclaw/.cache
+
 USER openclaw
 
 RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
