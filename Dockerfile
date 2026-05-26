@@ -14,6 +14,7 @@ RUN apt-get update \
     procps \
     python3 \
     build-essential \
+    tini \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
