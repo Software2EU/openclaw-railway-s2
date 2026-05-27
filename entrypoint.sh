@@ -11,4 +11,9 @@ fi
 rm -rf /home/linuxbrew/.linuxbrew
 ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
 
+# Kill any stale gateway from a previous container lifecycle
+# (the /data volume persists across redeploys, so old processes can linger)
+pkill -f openclaw-gateway 2>/dev/null || true
+sleep 1
+
 exec tini -- gosu openclaw node src/server.js
