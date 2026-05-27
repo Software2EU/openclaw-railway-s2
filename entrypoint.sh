@@ -18,41 +18,33 @@ sleep 1
 # Install gbrain CLI shim (calls GBrain MCP via HTTP)
 cat > /usr/local/bin/gbrain << 'GBRAIN_SHIM'
 #!/usr/bin/env node
-const http = require('http');
-const args = process.argv.slice(2);
-const cmd = args[0];
-const slug = args[1];
-const opts = {
-  hostname: 'gbrain-mcp.railway.internal',
-  port: 3131,
-  path: '/mcp',
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-    'Authorization': 'Bearer gbrain_5d9b1e7e83b44b4f8ec1c813eacd99888868675ef27b3661334bfa414be55709'
-  }
+const http=require('http'),fs=require('fs'),args=process.argv.slice(2),cmd=args[0],slug=args[1];
+const opts={hostname:'gbrain-mcp.railway.internal',port:3131,path:'/mcp',method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream','Authorization':'Bearer gbrain_5d9b1e7e83b44b4f8ec1c813eacd99888868675ef27b3661334bfa414be55709'}};
+const call=(name,a={})=>JSON.stringify({jsonrpc:'2.0',method:'tools/call',params:{name,arguments:a},id:1});
+const cmds={
+  get_page:()=>call('get_page',{slug}),
+  put_page:()=>call('put_page',{slug,content:fs.readFileSync(args[2],'utf8')}),
+  search:()=>call('search',{query:slug,limit:10}),
+  query:()=>call('query',{query:slug,limit:10}),
+  dream:()=>call('submit_job',{name:'autopilot-cycle',data:{}}),
+  doctor:()=>call('run_doctor'),
+  orphans:()=>call('find_orphans'),
+  backlinks:()=>call('get_backlinks',{slug}),
+  health:()=>call('get_health'),
+  stats:()=>call('get_stats'),
+  links:()=>call('get_links',{slug}),
+  timeline:()=>call('get_timeline',{slug}),
+  'add-timeline':()=>call('add_timeline_entry',{slug,date:args[2],summary:args[3]}),
+  think:()=>call('think',{question:slug}),
+  'list-tools':()=>JSON.stringify({jsonrpc:'2.0',method:'tools/list',params:{},id:1}),
+  delete:()=>call('delete_page',{slug}),
+  list:()=>call('list_pages',{type:slug,limit:50}),
+  versions:()=>call('get_versions',{slug}),
+  jobs:()=>call('list_jobs',{limit:20}),
 };
-let body;
-if (cmd === 'get_page') {
-  body = JSON.stringify({jsonrpc:'2.0',method:'tools/call',params:{name:'get_page',arguments:{slug}},id:1});
-} else if (cmd === 'put_page') {
-  const content = require('fs').readFileSync(args[2],'utf8');
-  const summary = args[3] || slug;
-  body = JSON.stringify({jsonrpc:'2.0',method:'tools/call',params:{name:'put_page',arguments:{slug,content,summary}},id:1});
-} else if (cmd === 'search') {
-  body = JSON.stringify({jsonrpc:'2.0',method:'tools/call',params:{name:'query',arguments:{question:slug,limit:5}},id:1});
-} else {
-  console.log('Usage: gbrain get_page <slug> | put_page <slug> <file> [summary] | search <query>');
-  process.exit(1);
-}
-const req = http.request(opts, res => {
-  let data = '';
-  res.on('data', c => data += c);
-  res.on('end', () => console.log(data));
-});
-req.write(body);
-req.end();
+if(!cmds[cmd]){console.log('Commands: '+Object.keys(cmds).join(', '));process.exit(1);}
+const req=http.request(opts,r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>console.log(d));});
+req.write(cmds[cmd]());req.end();
 GBRAIN_SHIM
 chmod +x /usr/local/bin/gbrain
 
