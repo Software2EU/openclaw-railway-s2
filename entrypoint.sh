@@ -1,5 +1,8 @@
 #!/bin/bash
 set -e
+
+STATE_DIR=/data/.openclaw
+
 chown -R openclaw:openclaw /data
 chmod 700 /data
 if [ ! -d /data/.linuxbrew ]; then
@@ -7,9 +10,31 @@ if [ ! -d /data/.linuxbrew ]; then
 fi
 rm -rf /home/linuxbrew/.linuxbrew
 ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
-# Kill any stale gateway from a previous container lifecycle
+
+# Kill any stale gateway + lock from a previous container lifecycle
 pkill -f openclaw-gateway 2>/dev/null || true
+rm -f "$STATE_DIR"/*.lock 2>/dev/null || true
 sleep 1
+
+# --- Apply secrets from env vars on every boot (idempotent) ---
+# Anthropic key -> both agents' auth-profiles.json (rotation = redeploy, no SSH)
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  for agent in main dashboard; do
+    f="$STATE_DIR/agents/$agent/agent/auth-profiles.json"
+    if [ -f "$f" ]; then
+      sed -i "s|\"key\": \"sk-ant-[^\"]*\"|\"key\": \"$ANTHROPIC_API_KEY\"|" "$f"
+    fi
+  done
+fi
+
+# Gateway token -> openclaw.json (deterministic token = no re-pairing after redeploy)
+if [ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+  gosu openclaw openclaw config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" || true
+fi
+
+# Re-normalize ownership: sed above ran as root and may have re-owned files
+chown -R openclaw:openclaw /data
+
 # Install gbrain CLI shim (calls GBrain MCP via HTTP)
 # GBRAIN_API_KEY must be set as a Railway environment variable on this service
 cat > /usr/local/bin/gbrain << GBRAIN_SHIM
@@ -43,4 +68,5 @@ const req=http.request(opts,r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>con
 req.write(cmds[cmd]());req.end();
 GBRAIN_SHIM
 chmod +x /usr/local/bin/gbrain
+
 exec tini -- gosu openclaw node src/server.js
