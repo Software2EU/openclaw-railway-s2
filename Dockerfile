@@ -57,13 +57,27 @@ RUN useradd -m -s /bin/bash openclaw \
     && mkdir -p /data && chown openclaw:openclaw /data \
     && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
 
-# Pre-install ACP's acpx backend at build time (as root) and hand it to the
-# openclaw user. At runtime acpx otherwise tries to npm-install into this
-# root-owned dir as the openclaw user and fails with EACCES. Pin is acpx@0.1.16
-# — the runtime's ACPX_PINNED_VERSION, not the 0.3.0 in package.json.
-RUN cd /usr/local/lib/node_modules/openclaw/extensions/acpx \
- && npm install --omit=dev acpx@0.1.16 \
- && chown -R openclaw:openclaw /usr/local/lib/node_modules/openclaw/extensions/acpx
+# Pre-install ACP's acpx backend at build time (as root) and hand the whole
+# extension dir to the openclaw user. At runtime the acpx plugin tries to
+# npm-install acpx@0.1.16 into this dir as the openclaw user; the dir is
+# root-owned (from `npm install -g openclaw` above) so that write fails with
+# EACCES. chown -R makes it openclaw-owned so EITHER this build-time install
+# sticks OR a runtime self-install succeeds. Pin is acpx@0.1.16 — the runtime's
+# ACPX_PINNED_VERSION, not the 0.3.0 in package.json. Runs AFTER `useradd`
+# (chown needs the user) and AFTER `npm install -g openclaw` (the dir must
+# exist). `set -eux` + the version echo make the step visible in the build log
+# and fail loudly if the path ever moves. The reworked instruction text also
+# changes this layer's cache key, so a correct build re-runs it (and the chown)
+# rather than reusing a stale pre-acpx layer.
+RUN set -eux; \
+    acpx_dir=/usr/local/lib/node_modules/openclaw/extensions/acpx; \
+    echo "[build] acpx-preinstall step (rev2)"; \
+    test -d "$acpx_dir"; \
+    cd "$acpx_dir"; \
+    npm install --omit=dev acpx@0.1.16; \
+    chown -R openclaw:openclaw "$acpx_dir"; \
+    node -e "console.log('[build] acpx installed:', require('$acpx_dir/node_modules/acpx/package.json').version)"; \
+    ls -ld "$acpx_dir"
 
 # Copy Playwright browsers to openclaw user's home (accessible during runtime)
 RUN mkdir -p /home/openclaw/.cache/ms-playwright \
