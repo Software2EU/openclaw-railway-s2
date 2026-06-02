@@ -32,6 +32,45 @@ if [ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
   gosu openclaw openclaw config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" || true
 fi
 
+# acpx auto-approve tool permissions for headless ACP/factory dispatch.
+# A dispatched gstack turn spawns Claude Code over ACP with no human attached.
+# When acpx receives session/request_permission it runs resolvePermissionRequest:
+# the default mode "approve-reads" auto-denies non-read tools (bash/edit) in a
+# headless (no-TTY) process -> "User refused permission to run tool" -> the turn
+# fails (ACP_TURN_FAILED). The OpenClaw acpx backend builds the acpx CLI args
+# from plugins.entries.acpx.config.permissionMode (runtime.ts buildPermissionArgs);
+# setting it to "approve-all" makes resolvePermissionRequest *select the allow
+# option* for every request_permission, so the prompt is granted automatically.
+#
+# SCOPE: this only changes how the acpx ACP runtime backend is spawned — i.e. the
+# Claude Code coding sessions started by factory dispatches. It does NOT touch the
+# gateway/orchestrator's own permission model or any other plugin/channel.
+# BLAST RADIUS: every ACP-spawned session now runs ALL tools (bash, file edits,
+# network) without confirmation as the openclaw user in the dispatch cwd. A
+# prompt-injected or hostile review target could get arbitrary code execution.
+# This is inherent to headless autonomy; acpx offers no finer per-dispatch gate
+# through this lever (only per-cwd .acpxrc.json, which can't cover repos cloned
+# at runtime). Applied idempotently on every boot so it survives redeploys.
+CFG="${OPENCLAW_CONFIG_PATH:-$STATE_DIR/openclaw.json}"
+if [ -f "$CFG" ]; then
+  node -e '
+    const fs = require("fs"), f = process.argv[1];
+    let c; try { c = JSON.parse(fs.readFileSync(f, "utf8")); } catch { process.exit(0); }
+    c.plugins ??= {}; c.plugins.entries ??= {};
+    const acpx = (c.plugins.entries.acpx ??= {});
+    acpx.config ??= {};
+    if (acpx.config.permissionMode === "approve-all") {
+      console.log("[acpx] permissionMode already approve-all"); process.exit(0);
+    }
+    acpx.config.permissionMode = "approve-all";
+    fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
+    console.log("[acpx] set plugins.entries.acpx.config.permissionMode=approve-all");
+  ' "$CFG" || true
+  chown openclaw:openclaw "$CFG" 2>/dev/null || true
+else
+  echo "[acpx] $CFG not present yet (unconfigured) — permissionMode applies after onboarding + next boot"
+fi
+
 # Re-normalize ownership: sed above ran as root and may have re-owned files
 chown -R openclaw:openclaw /data
 
