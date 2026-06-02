@@ -71,6 +71,35 @@ else
   echo "[acpx] $CFG not present yet (unconfigured) — permissionMode applies after onboarding + next boot"
 fi
 
+# Also set acpx's OWN config (~/.acpx/config.json) defaultPermissions=approve-all.
+# WHY, precisely (read from acpx@0.1.16 source):
+#   - The DISPATCH turn is `acpx ... claude prompt` and OpenClaw's acpx backend
+#     adds `--approve-all` to it from plugins.entries.acpx.config.permissionMode
+#     (extensions/acpx runtime.ts buildPromptArgs -> shared.ts buildPermissionArgs).
+#     That plugin config is resolved ONCE at gateway startup (service.ts), so the
+#     openclaw.json edit above only takes effect on a fresh gateway (redeploy).
+#   - A bare `acpx claude exec`/`prompt` WITHOUT the flag falls back to
+#     resolvePermissionMode(flags, config.defaultPermissions) where config is
+#     acpx's own ~/.acpx/config.json (cli.js handleExec/loadResolvedConfig);
+#     default is approve-reads, which auto-denies non-read tools headlessly.
+# Setting defaultPermissions here makes: (a) manual `acpx claude exec` honor
+# approve-all (so that test is actually valid), and (b) any acpx path that
+# doesn't pass an explicit flag default to approve-all too. The explicit
+# --approve-all the dispatch passes still wins regardless. Idempotent; merges to
+# preserve any other keys; owned by the openclaw user (HOME=/home/openclaw).
+ACPX_CFG=/home/openclaw/.acpx/config.json
+mkdir -p /home/openclaw/.acpx
+node -e '
+  const fs = require("fs"), f = process.argv[1];
+  let c = {};
+  try { c = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+  if (c.defaultPermissions === "approve-all") { console.log("[acpx] ~/.acpx/config.json already approve-all"); process.exit(0); }
+  c.defaultPermissions = "approve-all";
+  fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
+  console.log("[acpx] set ~/.acpx/config.json defaultPermissions=approve-all");
+' "$ACPX_CFG" || true
+chown -R openclaw:openclaw /home/openclaw/.acpx 2>/dev/null || true
+
 # Re-normalize ownership: sed above ran as root and may have re-owned files
 chown -R openclaw:openclaw /data
 
