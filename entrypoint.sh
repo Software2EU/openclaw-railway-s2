@@ -90,39 +90,81 @@ else
   echo "[git-auth] WARNING: no S2_GITHUB_TOKEN/GITHUB_TOKEN set -> git clone/push will be unauthenticated" >&2
 fi
 
-# --- Skill preflight: FAIL LOUDLY if GStack skills are not installed ---------
-# The dashboard dispatches named skills (product-review, qa, ...). If the image
-# was built without GStack (the bug this commit fixes), the worker must NOT
-# silently improvise a "review" — it surfaces an explicit, machine-detectable
-# error (skills-status.json + non-zero exit) so the dashboard can react.
+# --- Wire the gstack "Coding Tasks" dispatch section into AGENTS.md ----------
+# OpenClaw runs gstack skills by spawning a Claude Code session over ACP. The
+# orchestrator only does that if its AGENTS.md tells it to ("Always spawn, never
+# redirect"). Without it the gateway agent answers inline and improvises. We
+# vendor gstack's ready-to-paste section and inject it idempotently (replacing
+# any previous copy between the markers) into the agent + workspace AGENTS.md.
+SECTION_FILE=/app/gstack/agents-gstack-section.md
+WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-/data/workspace}"
+apply_agents_section() {
+  target="$1"
+  [ -f "$SECTION_FILE" ] || return 0
+  mkdir -p "$(dirname "$target")"
+  [ -f "$target" ] || : > "$target"
+  awk '
+    index($0,"<!-- gstack:coding-tasks -->"){skip=1}
+    skip==0{print}
+    index($0,"<!-- /gstack:coding-tasks -->"){skip=0}
+  ' "$target" > "$target.tmp" && mv "$target.tmp" "$target"
+  printf '\n' >> "$target"
+  cat "$SECTION_FILE" >> "$target"
+  chown openclaw:openclaw "$target" 2>/dev/null || true
+  echo "[agents] wired gstack Coding Tasks section into $target"
+}
+apply_agents_section "$WORKSPACE_DIR/AGENTS.md"
+for d in "$STATE_DIR"/agents/*/; do
+  [ -d "$d" ] && apply_agents_section "${d%/}/AGENTS.md"
+done
+
+# --- Skill preflight: FAIL LOUDLY unless Claude Code + real gstack skills exist
+# gstack skills are Claude Code skills run via ACP. The worker is only able to
+# run a real skill if BOTH (a) `claude` resolves on PATH and (b) gstack actually
+# registered the named skills (each <skill>/SKILL.md exists). If either is
+# missing the worker must NOT improvise — it writes a machine-detectable error
+# (skills-status.json -> /skills 503) and, by default, refuses to start.
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-/home/openclaw/.claude/skills}"
-REQUIRED_SKILLS="${REQUIRED_SKILLS:-gstack}"
+REQUIRED_SKILLS="${REQUIRED_SKILLS:-review cso ship}"
 SKILLS_STATUS="$STATE_DIR/skills-status.json"
 mkdir -p "$STATE_DIR"
+
+CLAUDE_BIN="$(gosu openclaw sh -lc 'command -v claude' 2>/dev/null || true)"
+CLAUDE_VERSION="$(gosu openclaw sh -lc 'claude --version' 2>/dev/null | head -1 || true)"
+
 missing=""
 for s in $REQUIRED_SKILLS; do
-  [ -e "$SKILLS_DIR/$s" ] || missing="$missing $s"
+  # -f follows symlinks: gstack registers each skill as a symlink into the repo.
+  [ -f "$SKILLS_DIR/$s/SKILL.md" ] || missing="$missing $s"
 done
 installed="$(ls -1 "$SKILLS_DIR" 2>/dev/null | paste -sd, - || true)"
 missing="$(echo $missing | xargs || true)"
-if [ -n "$missing" ]; then
-  printf '{"ok":false,"error":"SKILLS_NOT_INSTALLED","missing":"%s","installed":"%s","skillsDir":"%s"}\n' \
+
+fail=0
+[ -z "$CLAUDE_BIN" ] && fail=1
+[ -n "$missing" ] && fail=1
+
+if [ "$fail" -eq 1 ]; then
+  printf '{"ok":false,"error":"SKILLS_NOT_INSTALLED","claude":%s,"claudeVersion":"%s","missing":"%s","installed":"%s","skillsDir":"%s"}\n' \
+    "$([ -n "$CLAUDE_BIN" ] && echo true || echo false)" "$CLAUDE_VERSION" \
     "$missing" "$installed" "$SKILLS_DIR" > "$SKILLS_STATUS"
   chown openclaw:openclaw "$SKILLS_STATUS" 2>/dev/null || true
   echo "========================================================================" >&2
-  echo "[skills] FATAL: required GStack skill(s) NOT installed: $missing" >&2
+  [ -z "$CLAUDE_BIN" ] && echo "[skills] FATAL: Claude Code (\`claude\`) not on PATH — nothing to spawn." >&2
+  [ -n "$missing" ] && echo "[skills] FATAL: gstack did not register skill(s): $missing" >&2
   echo "[skills] scanned $SKILLS_DIR (found: ${installed:-none})" >&2
-  echo "[skills] The worker refuses to improvise reviews. Rebuild the image with" >&2
-  echo "[skills] the GStack install (see Dockerfile) before dispatching skills." >&2
+  echo "[skills] The worker refuses to improvise. Rebuild the image so Claude Code" >&2
+  echo "[skills] is installed and 'gstack ./setup' registers the skills." >&2
   echo "========================================================================" >&2
   if [ "${REQUIRE_SKILLS:-1}" = "1" ]; then
     echo "[skills] REQUIRE_SKILLS=1 -> refusing to start (set REQUIRE_SKILLS=0 to override)" >&2
     exit 1
   fi
 else
-  printf '{"ok":true,"installed":"%s","skillsDir":"%s"}\n' "$installed" "$SKILLS_DIR" > "$SKILLS_STATUS"
+  printf '{"ok":true,"claude":true,"claudeVersion":"%s","installed":"%s","skillsDir":"%s"}\n' \
+    "$CLAUDE_VERSION" "$installed" "$SKILLS_DIR" > "$SKILLS_STATUS"
   chown openclaw:openclaw "$SKILLS_STATUS" 2>/dev/null || true
-  echo "[skills] OK -> installed: $installed"
+  echo "[skills] OK -> claude: $CLAUDE_VERSION | skills: $installed"
 fi
 
 exec tini -- gosu openclaw node src/server.js

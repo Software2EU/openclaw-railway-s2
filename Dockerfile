@@ -24,6 +24,17 @@ RUN npx --yes playwright@latest install-deps chromium
 
 RUN npm install -g openclaw@2026.3.13 clawhub@latest
 
+# Claude Code CLI. gstack skills (/review, /cso, /ship, ...) are Claude Code
+# skills: OpenClaw runs them by spawning a Claude Code session over ACP, so the
+# `claude` binary MUST be on PATH or the agent has nothing to spawn and falls
+# back to improvising. Package name per Anthropic's official install docs
+# (https://code.claude.com/docs/en/setup -> "Install with npm").
+# The npm package links a per-platform native binary into /usr/local/bin/claude
+# (on PATH for every user). Auto-update is pointless in an immutable image.
+ENV DISABLE_AUTOUPDATER=1
+RUN npm install -g @anthropic-ai/claude-code \
+    && claude --version
+
 # Backward-compatibility shim for older OPENCLAW_ENTRY values.
 RUN mkdir -p /openclaw \
     && ln -sfn /usr/local/lib/node_modules/openclaw/dist /openclaw/dist
@@ -38,6 +49,7 @@ RUN corepack enable \
     && pnpm install --frozen-lockfile --prod
 
 COPY src ./src
+COPY gstack ./gstack
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 
 RUN useradd -m -s /bin/bash openclaw \
@@ -68,38 +80,42 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV BUN_INSTALL="/home/openclaw/.bun"
 ENV PATH="/home/openclaw/.bun/bin:${PATH}"
 
-# === S2: Install GStack to ONE canonical path ==============================
-# GStack provides the real product-review / qa / design-review skills the
-# dashboard dispatches. It was accidentally dropped from this Dockerfile in
-# commit 73df843 (the "Session 15" rewrite left a `RUN <install ... gstack>`
-# placeholder comment that was never filled back in), which is why the agent
-# had no skills on disk and improvised reviews instead.
+# === S2: Install GStack the canonical way ==================================
+# gstack ships its skills as TOP-LEVEL folders (review/, cso/, ship/, qa/, ...)
+# and its own `./setup` registers them per-host. For OpenClaw the host is
+# Claude Code (OpenClaw spawns Claude Code over ACP), so we install gstack into
+# Claude Code's skills dir and let `./setup` (default --host claude) wire up the
+# slash commands. `./setup --host openclaw` is intentionally a no-op that only
+# prints docs, so we do NOT use it.
 #
-# GSTACK_DIR is the single source of truth. The skill-discovery directory
-# (~/.claude/skills) links straight back to it, so there is no /opt/gstack vs
-# /home/openclaw/gstack split — install path, discovery scan, and PATH all
-# resolve to the same tree.
-ENV GSTACK_DIR="/home/openclaw/gstack"
+# Canonical path: the clone IS the install — gstack lives directly at
+# ~/.claude/skills/gstack and `./setup` symlinks each skill folder beside it in
+# ~/.claude/skills. No second copy, no /opt split.
+#
+# Dropped in commit 73df843 (the "Session 15" rewrite left a
+# `RUN <install ... gstack>` placeholder that was never filled back in), which
+# is why the agent had no skills and improvised reviews.
 ENV CLAUDE_SKILLS_DIR="/home/openclaw/.claude/skills"
-# Optional build-time token for cloning a private GStack (runtime auth is wired
-# separately in entrypoint.sh). Pass with: --build-arg GSTACK_TOKEN=...
+ENV GSTACK_DIR="/home/openclaw/.claude/skills/gstack"
+# Optional build-time token for cloning a private GStack (runtime git auth is
+# wired separately in entrypoint.sh). Pass with: --build-arg GSTACK_TOKEN=...
 ARG GSTACK_TOKEN=
 RUN set -eu; \
     url="https://github.com/garrytan/gstack.git"; \
     if [ -n "$GSTACK_TOKEN" ]; then \
       url="https://x-access-token:${GSTACK_TOKEN}@github.com/garrytan/gstack.git"; \
     fi; \
+    mkdir -p "$CLAUDE_SKILLS_DIR"; \
     git clone --single-branch --depth 1 "$url" "$GSTACK_DIR"; \
     cd "$GSTACK_DIR"; \
-    bun install --ignore-scripts; \
-    if [ -x ./setup ]; then NONINTERACTIVE=1 ./setup || true; fi; \
-    mkdir -p "$CLAUDE_SKILLS_DIR"; \
-    if [ -d "$GSTACK_DIR/skills" ]; then \
-      cp -R "$GSTACK_DIR/skills/." "$CLAUDE_SKILLS_DIR/"; \
-    fi; \
-    [ -e "$CLAUDE_SKILLS_DIR/gstack" ] || ln -sfn "$GSTACK_DIR" "$CLAUDE_SKILLS_DIR/gstack"; \
-    echo "[build] GStack skills registered in $CLAUDE_SKILLS_DIR:"; \
-    ls -1 "$CLAUDE_SKILLS_DIR"
+    bun install; \
+    bun run build; \
+    bunx playwright install chromium; \
+    GSTACK_SKIP_FONTS=1 ./setup --no-prefix --no-plan-tune-hooks; \
+    echo "[build] gstack skills registered in $CLAUDE_SKILLS_DIR:"; \
+    ls -1 "$CLAUDE_SKILLS_DIR"; \
+    test -f "$CLAUDE_SKILLS_DIR/review/SKILL.md"; \
+    test -f "$CLAUDE_SKILLS_DIR/cso/SKILL.md"
 
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
