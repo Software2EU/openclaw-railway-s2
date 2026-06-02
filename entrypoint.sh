@@ -56,19 +56,30 @@ if [ -f "$CFG" ]; then
   node -e '
     const fs = require("fs"), f = process.argv[1];
     let c; try { c = JSON.parse(fs.readFileSync(f, "utf8")); } catch { process.exit(0); }
+    let changed = false;
+    // 1) Auto-approve acpx tool permissions (headless ACP dispatch).
     c.plugins ??= {}; c.plugins.entries ??= {};
     const acpx = (c.plugins.entries.acpx ??= {});
     acpx.config ??= {};
-    if (acpx.config.permissionMode === "approve-all") {
-      console.log("[acpx] permissionMode already approve-all"); process.exit(0);
+    if (acpx.config.permissionMode !== "approve-all") {
+      acpx.config.permissionMode = "approve-all"; changed = true;
+      console.log("[acpx] set plugins.entries.acpx.config.permissionMode=approve-all");
     }
-    acpx.config.permissionMode = "approve-all";
-    fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
-    console.log("[acpx] set plugins.entries.acpx.config.permissionMode=approve-all");
+    // 2) Raise the agent turn timeout so long gstack /review dispatches finish.
+    // resolveAgentTimeoutSeconds(cfg) reads cfg.agents.defaults.timeoutSeconds
+    // (auth-profiles-*.js) -> timeoutMs -> runEmbeddedPiAgent (agent-*.js), which
+    // wraps the ACP runtime turn. 900s killed acpx mid-/review; 3600s = 1h.
+    c.agents ??= {}; c.agents.defaults ??= {};
+    if (c.agents.defaults.timeoutSeconds !== 3600) {
+      c.agents.defaults.timeoutSeconds = 3600; changed = true;
+      console.log("[acpx] set agents.defaults.timeoutSeconds=3600");
+    }
+    if (changed) fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
+    else console.log("[acpx] openclaw.json already has permissionMode=approve-all + timeoutSeconds=3600");
   ' "$CFG" || true
   chown openclaw:openclaw "$CFG" 2>/dev/null || true
 else
-  echo "[acpx] $CFG not present yet (unconfigured) — permissionMode applies after onboarding + next boot"
+  echo "[acpx] $CFG not present yet (unconfigured) — permissionMode + timeoutSeconds apply after onboarding + next boot"
 fi
 
 # Also set acpx's OWN config (~/.acpx/config.json) defaultPermissions=approve-all.
