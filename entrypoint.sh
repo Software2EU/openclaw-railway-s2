@@ -65,17 +65,18 @@ if [ -f "$CFG" ]; then
       acpx.config.permissionMode = "approve-all"; changed = true;
       console.log("[acpx] set plugins.entries.acpx.config.permissionMode=approve-all");
     }
-    // 2) Raise the agent turn timeout so long gstack /review dispatches finish.
-    // resolveAgentTimeoutSeconds(cfg) reads cfg.agents.defaults.timeoutSeconds
-    // (auth-profiles-*.js) -> timeoutMs -> runEmbeddedPiAgent (agent-*.js), which
-    // wraps the ACP runtime turn. 900s killed acpx mid-/review; 3600s = 1h.
+    // 2) Cap the agent turn timeout so a runaway dispatch cannot burn unbounded
+    // cost/time. resolveAgentTimeoutSeconds(cfg) reads cfg.agents.defaults
+    // .timeoutSeconds (auth-profiles-*.js) -> timeoutMs -> runEmbeddedPiAgent
+    // (agent-*.js), which wraps the ACP runtime turn. 1200s (20 min) finishes a
+    // scoped review but hard-caps a runaway (was 3600).
     c.agents ??= {}; c.agents.defaults ??= {};
-    if (c.agents.defaults.timeoutSeconds !== 3600) {
-      c.agents.defaults.timeoutSeconds = 3600; changed = true;
-      console.log("[acpx] set agents.defaults.timeoutSeconds=3600");
+    if (c.agents.defaults.timeoutSeconds !== 1200) {
+      c.agents.defaults.timeoutSeconds = 1200; changed = true;
+      console.log("[acpx] set agents.defaults.timeoutSeconds=1200");
     }
     if (changed) fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
-    else console.log("[acpx] openclaw.json already has permissionMode=approve-all + timeoutSeconds=3600");
+    else console.log("[acpx] openclaw.json already has permissionMode=approve-all + timeoutSeconds=1200");
   ' "$CFG" || true
   chown openclaw:openclaw "$CFG" 2>/dev/null || true
 else

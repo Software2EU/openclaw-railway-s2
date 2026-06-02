@@ -139,6 +139,30 @@ RUN set -eu; \
     test -f "$CLAUDE_SKILLS_DIR/review/SKILL.md"; \
     test -f "$CLAUDE_SKILLS_DIR/cso/SKILL.md"
 
+# === S2 cost guard: refuse oversized /review diffs (Guard 3) =================
+# gstack /review fans out parallel specialist subagents that each re-read the
+# full diff; on a huge working-tree diff that is slow and very expensive (a
+# single unscoped review cost ~$33). gstack only gates the LOWER end (skips
+# specialists < 50 lines) and has no upper bound. Inject a hard upper-bound abort
+# into the installed review SKILL.md, right after "Step 3: Get the diff" and
+# before the critical pass (Step 4) / specialist dispatch (Step 4.5). This uses
+# the same prompt-gating mechanism gstack already relies on for its lower gate.
+# Idempotent (marker); fails the build loudly if the gate anchor ever moves so we
+# notice gstack drift instead of silently losing the guard.
+RUN node -e ' \
+  const fs = require("fs"); \
+  const skill = process.env.GSTACK_DIR + "/review/SKILL.md"; \
+  const guard = fs.readFileSync("/app/gstack/review-diff-guard.md", "utf8"); \
+  let s = fs.readFileSync(skill, "utf8"); \
+  if (s.includes("s2-diff-guard")) { console.log("[build] diff guard already present"); process.exit(0); } \
+  let anchor = "\n## Step 3.4:"; let i = s.indexOf(anchor); \
+  if (i < 0) { anchor = "\n## Step 4: Critical pass"; i = s.indexOf(anchor); } \
+  if (i < 0) { console.error("[build] FATAL: review SKILL.md gate anchor not found (gstack drift?)"); process.exit(1); } \
+  s = s.slice(0, i + 1) + guard + "\n" + s.slice(i + 1); \
+  fs.writeFileSync(skill, s); \
+  console.log("[build] injected diff-size scope guard into review SKILL.md before " + anchor.trim()); \
+'
+
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
 
