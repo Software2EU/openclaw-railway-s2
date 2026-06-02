@@ -57,6 +57,14 @@ RUN useradd -m -s /bin/bash openclaw \
     && mkdir -p /data && chown openclaw:openclaw /data \
     && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
 
+# Pre-install ACP's acpx backend at build time (as root) and hand it to the
+# openclaw user. At runtime acpx otherwise tries to npm-install into this
+# root-owned dir as the openclaw user and fails with EACCES. Pin is acpx@0.1.16
+# — the runtime's ACPX_PINNED_VERSION, not the 0.3.0 in package.json.
+RUN cd /usr/local/lib/node_modules/openclaw/extensions/acpx \
+ && npm install --omit=dev acpx@0.1.16 \
+ && chown -R openclaw:openclaw /usr/local/lib/node_modules/openclaw/extensions/acpx
+
 # Copy Playwright browsers to openclaw user's home (accessible during runtime)
 RUN mkdir -p /home/openclaw/.cache/ms-playwright \
     && cp -R /root/.cache/ms-playwright/* /home/openclaw/.cache/ms-playwright/ \
