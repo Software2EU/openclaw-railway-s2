@@ -69,4 +69,60 @@ req.write(cmds[cmd]());req.end();
 GBRAIN_SHIM
 chmod +x /usr/local/bin/gbrain
 
+# --- Git auth for non-interactive clone/push --------------------------------
+# The Railway service injects S2_GITHUB_TOKEN, but the docs/tooling historically
+# expect GITHUB_TOKEN, and nothing was wiring it into git — so authenticated
+# clone/push silently failed. Accept either (prefer S2_GITHUB_TOKEN), normalize
+# both env names, and configure git for the openclaw user via a store credential
+# helper + url.insteadOf so https clones work and ssh remotes are rewritten.
+GH_TOKEN="${S2_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -n "$GH_TOKEN" ]; then
+  export GITHUB_TOKEN="$GH_TOKEN"
+  export S2_GITHUB_TOKEN="$GH_TOKEN"
+  printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /home/openclaw/.git-credentials
+  chown openclaw:openclaw /home/openclaw/.git-credentials
+  chmod 600 /home/openclaw/.git-credentials
+  gosu openclaw git config --global credential.helper store
+  gosu openclaw git config --global url."https://github.com/".insteadOf "git@github.com:"
+  gosu openclaw git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+  echo "[git-auth] configured github.com credentials for openclaw user"
+else
+  echo "[git-auth] WARNING: no S2_GITHUB_TOKEN/GITHUB_TOKEN set -> git clone/push will be unauthenticated" >&2
+fi
+
+# --- Skill preflight: FAIL LOUDLY if GStack skills are not installed ---------
+# The dashboard dispatches named skills (product-review, qa, ...). If the image
+# was built without GStack (the bug this commit fixes), the worker must NOT
+# silently improvise a "review" — it surfaces an explicit, machine-detectable
+# error (skills-status.json + non-zero exit) so the dashboard can react.
+SKILLS_DIR="${CLAUDE_SKILLS_DIR:-/home/openclaw/.claude/skills}"
+REQUIRED_SKILLS="${REQUIRED_SKILLS:-gstack}"
+SKILLS_STATUS="$STATE_DIR/skills-status.json"
+mkdir -p "$STATE_DIR"
+missing=""
+for s in $REQUIRED_SKILLS; do
+  [ -e "$SKILLS_DIR/$s" ] || missing="$missing $s"
+done
+installed="$(ls -1 "$SKILLS_DIR" 2>/dev/null | paste -sd, - || true)"
+missing="$(echo $missing | xargs || true)"
+if [ -n "$missing" ]; then
+  printf '{"ok":false,"error":"SKILLS_NOT_INSTALLED","missing":"%s","installed":"%s","skillsDir":"%s"}\n' \
+    "$missing" "$installed" "$SKILLS_DIR" > "$SKILLS_STATUS"
+  chown openclaw:openclaw "$SKILLS_STATUS" 2>/dev/null || true
+  echo "========================================================================" >&2
+  echo "[skills] FATAL: required GStack skill(s) NOT installed: $missing" >&2
+  echo "[skills] scanned $SKILLS_DIR (found: ${installed:-none})" >&2
+  echo "[skills] The worker refuses to improvise reviews. Rebuild the image with" >&2
+  echo "[skills] the GStack install (see Dockerfile) before dispatching skills." >&2
+  echo "========================================================================" >&2
+  if [ "${REQUIRE_SKILLS:-1}" = "1" ]; then
+    echo "[skills] REQUIRE_SKILLS=1 -> refusing to start (set REQUIRE_SKILLS=0 to override)" >&2
+    exit 1
+  fi
+else
+  printf '{"ok":true,"installed":"%s","skillsDir":"%s"}\n' "$installed" "$SKILLS_DIR" > "$SKILLS_STATUS"
+  chown openclaw:openclaw "$SKILLS_STATUS" 2>/dev/null || true
+  echo "[skills] OK -> installed: $installed"
+fi
+
 exec tini -- gosu openclaw node src/server.js

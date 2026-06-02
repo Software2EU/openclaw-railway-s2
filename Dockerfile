@@ -63,6 +63,44 @@ ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
 ENV HOMEBREW_CELLAR="/home/linuxbrew/.linuxbrew/Cellar"
 ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"
 
+# === S2: Bun (runtime used by GStack skills) ===
+RUN curl -fsSL https://bun.sh/install | bash
+ENV BUN_INSTALL="/home/openclaw/.bun"
+ENV PATH="/home/openclaw/.bun/bin:${PATH}"
+
+# === S2: Install GStack to ONE canonical path ==============================
+# GStack provides the real product-review / qa / design-review skills the
+# dashboard dispatches. It was accidentally dropped from this Dockerfile in
+# commit 73df843 (the "Session 15" rewrite left a `RUN <install ... gstack>`
+# placeholder comment that was never filled back in), which is why the agent
+# had no skills on disk and improvised reviews instead.
+#
+# GSTACK_DIR is the single source of truth. The skill-discovery directory
+# (~/.claude/skills) links straight back to it, so there is no /opt/gstack vs
+# /home/openclaw/gstack split — install path, discovery scan, and PATH all
+# resolve to the same tree.
+ENV GSTACK_DIR="/home/openclaw/gstack"
+ENV CLAUDE_SKILLS_DIR="/home/openclaw/.claude/skills"
+# Optional build-time token for cloning a private GStack (runtime auth is wired
+# separately in entrypoint.sh). Pass with: --build-arg GSTACK_TOKEN=...
+ARG GSTACK_TOKEN=
+RUN set -eu; \
+    url="https://github.com/garrytan/gstack.git"; \
+    if [ -n "$GSTACK_TOKEN" ]; then \
+      url="https://x-access-token:${GSTACK_TOKEN}@github.com/garrytan/gstack.git"; \
+    fi; \
+    git clone --single-branch --depth 1 "$url" "$GSTACK_DIR"; \
+    cd "$GSTACK_DIR"; \
+    bun install --ignore-scripts; \
+    if [ -x ./setup ]; then NONINTERACTIVE=1 ./setup || true; fi; \
+    mkdir -p "$CLAUDE_SKILLS_DIR"; \
+    if [ -d "$GSTACK_DIR/skills" ]; then \
+      cp -R "$GSTACK_DIR/skills/." "$CLAUDE_SKILLS_DIR/"; \
+    fi; \
+    [ -e "$CLAUDE_SKILLS_DIR/gstack" ] || ln -sfn "$GSTACK_DIR" "$CLAUDE_SKILLS_DIR/gstack"; \
+    echo "[build] GStack skills registered in $CLAUDE_SKILLS_DIR:"; \
+    ls -1 "$CLAUDE_SKILLS_DIR"
+
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
 

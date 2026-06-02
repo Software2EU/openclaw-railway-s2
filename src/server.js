@@ -19,6 +19,8 @@ const WORKSPACE_DIR =
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+const SKILLS_STATUS_FILE = path.join(STATE_DIR, "skills-status.json");
+
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
@@ -377,12 +379,30 @@ app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
 });
 
+// Reports whether the GStack skills are installed. Written at boot by
+// entrypoint.sh; lets the dashboard detect a skill-less worker instead of
+// receiving an improvised "review".
+function readSkillsStatus() {
+  try {
+    return JSON.parse(fs.readFileSync(SKILLS_STATUS_FILE, "utf8"));
+  } catch {
+    return { ok: false, error: "SKILLS_STATUS_UNKNOWN" };
+  }
+}
+
 app.get("/healthz", async (_req, res) => {
   let gateway = "unconfigured";
   if (isConfigured()) {
     gateway = isGatewayReady() ? "ready" : "starting";
   }
-  res.json({ ok: true, gateway });
+  res.json({ ok: true, gateway, skills: readSkillsStatus() });
+});
+
+// Explicit, dashboard-detectable skill status. 200 when all required skills are
+// installed, 503 + { error: "SKILLS_NOT_INSTALLED" } when they are missing.
+app.get("/skills", (_req, res) => {
+  const status = readSkillsStatus();
+  res.status(status.ok ? 200 : 503).json(status);
 });
 
 app.get("/setup/healthz", async (_req, res) => {
