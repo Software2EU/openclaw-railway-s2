@@ -167,4 +167,46 @@ else
   echo "[skills] OK -> claude: $CLAUDE_VERSION | skills: $installed"
 fi
 
+# --- acpx session pre-init (fixes "session/load -> Resource not found" race) --
+# A dispatched gstack turn runs `acpx claude` with cwd set to the repo being
+# reviewed. acpx resolves a session by walking UP from cwd to the *git repo
+# root* and matching a record whose cwd EXACTLY equals a level in that walk
+# (matchesSessionEntry: session.cwd === dir). Creating a session also spawns
+# claude + does session/new over ACP — so the FIRST dispatch races session/load
+# against a not-yet-created session and fails with "Resource not found".
+#
+# Because the walk boundary is the git root, a session at the /data/workspace
+# PARENT does NOT cover a child repo like /data/workspace/zwergalpost (its own
+# git root). So we pre-create PER-REPO (Option B): `sessions ensure` (idempotent,
+# "current cwd or ancestor") for /data/workspace itself AND for every git repo
+# directly under it. Runs as the openclaw user, after the gateway is up.
+# acpx is not on PATH; use its full path. Best-effort (|| true) throughout.
+#
+# Residual gap: repos cloned *during* a session (not present at boot) still race
+# on their first dispatch — the durable fix for those is for the dispatch to run
+# `sessions ensure` in its own cwd before the turn (OpenClaw-side, out of scope).
+(
+  set +e  # best-effort: a failed health poll must never abort the pre-init
+  ACPX=/usr/local/lib/node_modules/openclaw/extensions/acpx/node_modules/.bin/acpx
+  [ -x "$ACPX" ] || exit 0
+  # Wait (bounded) for the wrapper to report the gateway is running.
+  for _ in $(seq 1 60); do
+    curl -fsS "http://127.0.0.1:${PORT:-8080}/setup/healthz" 2>/dev/null \
+      | grep -q '"gatewayRunning":true' && break
+    sleep 5
+  done
+  ensure_session() {
+    d="$1"
+    [ -d "$d" ] || return 0
+    echo "[acpx] ensuring claude session for cwd=$d"
+    gosu openclaw sh -lc 'cd "$1" && exec "$2" claude sessions ensure' _ "$d" "$ACPX" \
+      >/dev/null 2>&1 || true
+  }
+  ensure_session "$WORKSPACE_DIR"
+  for repo in "$WORKSPACE_DIR"/*/; do
+    [ -e "${repo}.git" ] && ensure_session "${repo%/}"
+  done
+  echo "[acpx] session pre-init complete"
+) &
+
 exec tini -- gosu openclaw node src/server.js
