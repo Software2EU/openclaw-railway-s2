@@ -18,6 +18,8 @@ RUN apt-get update \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 # Install Playwright system deps (Chromium needs these libraries)
 COPY --from=playwright-cache /root/.cache/ms-playwright /root/.cache/ms-playwright
 RUN npx --yes playwright@latest install-deps chromium
