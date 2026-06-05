@@ -205,27 +205,35 @@ done
 # boot and drop a marker-wrapped pointer into the workspace + per-agent AGENTS.md
 # so the agent auto-loads them. Idempotent (markers); /data persists, /home does
 # not. Source of truth: src/workflows/demo-content-factory.md (shipped in image).
-WORKFLOWS_SRC=/app/src/workflows/demo-content-factory.md
 WORKFLOWS_FILE="$WORKSPACE_DIR/WORKFLOWS.md"
-if [ -f "$WORKFLOWS_SRC" ]; then
-  mkdir -p "$WORKSPACE_DIR"
-  [ -f "$WORKFLOWS_FILE" ] || : > "$WORKFLOWS_FILE"
-  # Replace any prior managed block (between markers); preserve other content.
-  awk '
-    index($0,"<!-- s2:content-factory-demo -->"){skip=1}
+mkdir -p "$WORKSPACE_DIR"
+[ -f "$WORKFLOWS_FILE" ] || : > "$WORKFLOWS_FILE"
+
+# Seed one vendored workflow source into WORKFLOWS.md inside its own marker
+# block. Idempotent: any prior copy between the markers is replaced; content
+# outside the markers (incl. other workflow blocks) is preserved.
+# $1=source path  $2=marker id (no angle brackets)  $3=log label
+seed_workflow_block() {
+  src="$1"; marker="$2"; label="$3"
+  if [ ! -f "$src" ]; then
+    echo "[workflows] WARNING: $src missing — $label not seeded" >&2
+    return 0
+  fi
+  awk -v m="$marker" '
+    index($0,"<!-- "m" -->"){skip=1}
     skip==0{print}
-    index($0,"<!-- /s2:content-factory-demo -->"){skip=0}
+    index($0,"<!-- /"m" -->"){skip=0}
   ' "$WORKFLOWS_FILE" > "$WORKFLOWS_FILE.tmp" && mv "$WORKFLOWS_FILE.tmp" "$WORKFLOWS_FILE"
   {
-    printf '\n<!-- s2:content-factory-demo -->\n'
-    cat "$WORKFLOWS_SRC"
-    printf '<!-- /s2:content-factory-demo -->\n'
+    printf '\n<!-- %s -->\n' "$marker"
+    cat "$src"
+    printf '<!-- /%s -->\n' "$marker"
   } >> "$WORKFLOWS_FILE"
-  chown openclaw:openclaw "$WORKFLOWS_FILE" 2>/dev/null || true
-  echo "[workflows] seeded demo workflows into $WORKFLOWS_FILE"
-else
-  echo "[workflows] WARNING: $WORKFLOWS_SRC missing — demo workflows not seeded" >&2
-fi
+  echo "[workflows] seeded $label into $WORKFLOWS_FILE"
+}
+seed_workflow_block /app/src/workflows/demo-content-factory.md s2:content-factory-demo "demo workflows (5)"
+seed_workflow_block /app/src/workflows/pptx-content-factory.md s2:content-factory-pptx "pptx workflows (4)"
+chown openclaw:openclaw "$WORKFLOWS_FILE" 2>/dev/null || true
 
 # Point AGENTS.md (workspace + each agent) at WORKFLOWS.md so it auto-loads.
 apply_workflows_pointer() {
@@ -239,11 +247,12 @@ apply_workflows_pointer() {
   ' "$target" > "$target.tmp" && mv "$target.tmp" "$target"
   {
     printf '\n<!-- s2:demo-workflows -->\n'
-    printf '## Content Factory Demo Workflows\n\n'
-    printf 'On boot, load the demo video workflow definitions from `%s`.\n' "$WORKFLOWS_FILE"
+    printf '## Content Factory Workflows\n\n'
+    printf 'On boot, load the video pipeline workflow definitions from `%s`.\n' "$WORKFLOWS_FILE"
     printf 'Dispatch them via the API-facing agent over OpenClaw `/v1/chat/completions`\n'
     printf '(never `/runs`): `{"workflow":"<name>","params":{"project_slug":"<slug>"}}`.\n'
-    printf 'Registered: demo-record, demo-direct, demo-narrate, demo-voice, demo-assemble.\n'
+    printf 'Demo pipeline: demo-record, demo-direct, demo-narrate, demo-voice, demo-assemble.\n'
+    printf 'PPTX pipeline: pptx-ingest, webinar-transcribe, slide-redesign-render, slide-animate.\n'
     printf '<!-- /s2:demo-workflows -->\n'
   } >> "$target"
   chown openclaw:openclaw "$target" 2>/dev/null || true
