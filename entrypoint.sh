@@ -198,6 +198,71 @@ for d in "$STATE_DIR"/agents/*/; do
   [ -d "$d" ] && apply_agents_section "${d%/}/AGENTS.md"
 done
 
+# --- Seed Content Factory demo workflows (durable across redeploys) ----------
+# Workflow "registrations" are just agent context the API-facing agent reads
+# from WORKFLOWS.md. In-memory registration via chat is lost on redeploy, so we
+# (re)seed the canonical vendored definitions into the persistent volume on every
+# boot and drop a marker-wrapped pointer into the workspace + per-agent AGENTS.md
+# so the agent auto-loads them. Idempotent (markers); /data persists, /home does
+# not. Source of truth: src/workflows/demo-content-factory.md (shipped in image).
+WORKFLOWS_FILE="$WORKSPACE_DIR/WORKFLOWS.md"
+mkdir -p "$WORKSPACE_DIR"
+[ -f "$WORKFLOWS_FILE" ] || : > "$WORKFLOWS_FILE"
+
+# Seed one vendored workflow source into WORKFLOWS.md inside its own marker
+# block. Idempotent: any prior copy between the markers is replaced; content
+# outside the markers (incl. other workflow blocks) is preserved.
+# $1=source path  $2=marker id (no angle brackets)  $3=log label
+seed_workflow_block() {
+  src="$1"; marker="$2"; label="$3"
+  if [ ! -f "$src" ]; then
+    echo "[workflows] WARNING: $src missing — $label not seeded" >&2
+    return 0
+  fi
+  awk -v m="$marker" '
+    index($0,"<!-- "m" -->"){skip=1}
+    skip==0{print}
+    index($0,"<!-- /"m" -->"){skip=0}
+  ' "$WORKFLOWS_FILE" > "$WORKFLOWS_FILE.tmp" && mv "$WORKFLOWS_FILE.tmp" "$WORKFLOWS_FILE"
+  {
+    printf '\n<!-- %s -->\n' "$marker"
+    cat "$src"
+    printf '<!-- /%s -->\n' "$marker"
+  } >> "$WORKFLOWS_FILE"
+  echo "[workflows] seeded $label into $WORKFLOWS_FILE"
+}
+seed_workflow_block /app/src/workflows/demo-content-factory.md s2:content-factory-demo "demo workflows (5)"
+seed_workflow_block /app/src/workflows/pptx-content-factory.md s2:content-factory-pptx "pptx workflows (4)"
+chown openclaw:openclaw "$WORKFLOWS_FILE" 2>/dev/null || true
+
+# Point AGENTS.md (workspace + each agent) at WORKFLOWS.md so it auto-loads.
+apply_workflows_pointer() {
+  target="$1"
+  mkdir -p "$(dirname "$target")"
+  [ -f "$target" ] || : > "$target"
+  awk '
+    index($0,"<!-- s2:demo-workflows -->"){skip=1}
+    skip==0{print}
+    index($0,"<!-- /s2:demo-workflows -->"){skip=0}
+  ' "$target" > "$target.tmp" && mv "$target.tmp" "$target"
+  {
+    printf '\n<!-- s2:demo-workflows -->\n'
+    printf '## Content Factory Workflows\n\n'
+    printf 'On boot, load the video pipeline workflow definitions from `%s`.\n' "$WORKFLOWS_FILE"
+    printf 'Dispatch them via the API-facing agent over OpenClaw `/v1/chat/completions`\n'
+    printf '(never `/runs`): `{"workflow":"<name>","params":{"project_slug":"<slug>"}}`.\n'
+    printf 'Demo pipeline: demo-record, demo-direct, demo-narrate, demo-voice, demo-assemble.\n'
+    printf 'PPTX pipeline: pptx-ingest, webinar-transcribe, slide-redesign-render, slide-animate.\n'
+    printf '<!-- /s2:demo-workflows -->\n'
+  } >> "$target"
+  chown openclaw:openclaw "$target" 2>/dev/null || true
+  echo "[workflows] referenced WORKFLOWS.md in $target"
+}
+apply_workflows_pointer "$WORKSPACE_DIR/AGENTS.md"
+for d in "$STATE_DIR"/agents/*/; do
+  [ -d "$d" ] && apply_workflows_pointer "${d%/}/AGENTS.md"
+done
+
 # --- Skill preflight: FAIL LOUDLY unless Claude Code + real gstack skills exist
 # gstack skills are Claude Code skills run via ACP. The worker is only able to
 # run a real skill if BOTH (a) `claude` resolves on PATH and (b) gstack actually
