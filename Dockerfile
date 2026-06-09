@@ -20,7 +20,7 @@ RUN apt-get update \
 
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-impress python3-pip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-impress python3-pip poppler-utils && rm -rf /var/lib/apt/lists/*
 RUN python3 -m pip install --break-system-packages python-pptx
 RUN npm install -g pptx-viewer-core
 
