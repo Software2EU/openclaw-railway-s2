@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -r
 
 RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-impress python3-pip && rm -rf /var/lib/apt/lists/*
 RUN python3 -m pip install --break-system-packages python-pptx
+RUN npm install -g pptx-viewer-core
 
 # Install Playwright system deps (Chromium needs these libraries)
 COPY --from=playwright-cache /root/.cache/ms-playwright /root/.cache/ms-playwright
