@@ -232,7 +232,7 @@ seed_workflow_block() {
   echo "[workflows] seeded $label into $WORKFLOWS_FILE"
 }
 seed_workflow_block /app/src/workflows/demo-content-factory.md s2:content-factory-demo "demo workflows (5)"
-seed_workflow_block /app/src/workflows/pptx-content-factory.md s2:content-factory-pptx "pptx workflows (4)"
+seed_workflow_block /app/src/workflows/pptx-content-factory.md s2:content-factory-pptx "pptx workflows (5)"
 chown openclaw:openclaw "$WORKFLOWS_FILE" 2>/dev/null || true
 
 # Point AGENTS.md (workspace + each agent) at WORKFLOWS.md so it auto-loads.
@@ -252,7 +252,7 @@ apply_workflows_pointer() {
     printf 'Dispatch them via the API-facing agent over OpenClaw `/v1/chat/completions`\n'
     printf '(never `/runs`): `{"workflow":"<name>","params":{"project_slug":"<slug>"}}`.\n'
     printf 'Demo pipeline: demo-record, demo-direct, demo-narrate, demo-voice, demo-assemble.\n'
-    printf 'PPTX pipeline: pptx-ingest, webinar-transcribe, slide-redesign-render, slide-animate.\n'
+    printf 'PPTX pipeline: pptx-ingest, webinar-transcribe, slide-redesign-render, slide-animate, slide-present.\n'
     printf '<!-- /s2:demo-workflows -->\n'
   } >> "$target"
   chown openclaw:openclaw "$target" 2>/dev/null || true

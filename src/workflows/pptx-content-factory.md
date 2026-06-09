@@ -83,3 +83,25 @@ Action:
   9. gbrain put-page "content/${project_slug}" — update project, set animate phase to completed
 Timeout: 300 seconds
 Requirements: ffmpeg
+
+### slide-present
+Trigger: ACP dispatch with workflow name "slide-present"
+Parameters: { project_slug: string }
+Action:
+  1. gbrain get-page "content/${project_slug}" — read project
+  2. Extract animation-injected HTML slides from ## Design section + narration timing from ## Sprechertext
+  3. For each slide:
+     - Write the animation-injected HTML to a temp file
+     - Launch Playwright (headless Chromium, viewport 1920×1080)
+     - Navigate to file:///tmp/slide-N.html
+     - Wait 300ms for initial render
+     - Read click count from the slide's animation metadata
+     - For each click: fire page.click('body'), wait for narration-timed pause
+     - Hold on final state for remaining narration duration
+  4. Playwright recordVideo captures the entire click-through as WebM
+  5. Upload recorded video to brain via gbrain put-raw-data
+  6. Write ## Präsentation section with video ref
+  7. gbrain put-page "content/${project_slug}" — update project, set present phase to completed
+Timeout: 600 seconds (real-time recording — longer than other phases)
+Requirements: playwright, chromium, pptx-viewer-core
+Note: This workflow replaces slide-animate for decks that have PowerPoint animations. Static decks still use slide-animate (Ken Burns fallback).
