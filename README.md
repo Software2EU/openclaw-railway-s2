@@ -138,6 +138,24 @@ docker run --rm -p 8080:8080 \
 - `/healthz` - public health
 - `/logs` - live server logs UI
 
+## Scheduled jobs (S2 Brain context)
+
+This OpenClaw service is the **scheduler** for the S2 Brain dream/autopilot
+cycle. The cron `gbrain dream M/W/F 22:00 UTC` runs inside this container; the
+CLI compiles to `submit_job {name: "autopilot-cycle"}` against the gbrain-mcp
+service over MCP — it ENQUEUES the job, it does NOT execute it.
+
+Execution happens in the **gbrain-mcp** container (`gbrain jobs work`, started
+by that image's `entrypoint.sh`). OpenClaw runs zero minion-job consumers; do
+not add a `gbrain jobs work` to this container — that would race the gbrain-mcp
+worker for the same row.
+
+The June 2026 dream-cycle outage was NOT in this repo (the cron fired
+correctly every M/W/F for 15 days). The outage was that gbrain-mcp's worker
+wasn't running because a Railway custom Start Command override silently
+disabled the `gbrain jobs work` half of its CMD. That's been fixed by baking
+the worker into the gbrain-mcp entrypoint. See the gbrain-mcp README.
+
 ## Support
 
 Need help? Open an issue or use Railway Station support for this template.
