@@ -162,9 +162,21 @@ if [ -n "$GH_TOKEN" ]; then
   printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /home/openclaw/.git-credentials
   chown openclaw:openclaw /home/openclaw/.git-credentials
   chmod 600 /home/openclaw/.git-credentials
-  gosu openclaw git config --global credential.helper store
-  gosu openclaw git config --global url."https://github.com/".insteadOf "git@github.com:"
-  gosu openclaw git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+  gosu openclaw git config --global credential.helper store || echo "[git-auth] WARN: could not set credential.helper" >&2
+  # url.insteadOf is a MULTI-VALUED key (two rewrites: git@ and ssh://). A plain
+  # `git config <key> <value>` set FAILS with "cannot overwrite multiple values
+  # with a single value" once the key already holds >1 value — which it does from
+  # the second boot onward, because the `--add` below appends a second value and
+  # the openclaw user's ~/.gitconfig persists across container restarts. Under
+  # `set -e` that non-zero exit aborted the entrypoint → container crash-loop
+  # (each loop also rewrote openclaw.json + rotated the gateway token). Fix: clear
+  # ALL existing values first (idempotent regardless of how many accumulated),
+  # then add the two rewrites. Every config write here is `|| true`/`|| echo` so
+  # this non-critical git setup can NEVER crash-loop the container again. This
+  # keeps GitHub auth fully intact — it only makes the write multi-value-safe.
+  gosu openclaw git config --global --unset-all url."https://github.com/".insteadOf 2>/dev/null || true
+  gosu openclaw git config --global --add url."https://github.com/".insteadOf "git@github.com:" || echo "[git-auth] WARN: could not add git@ insteadOf rewrite" >&2
+  gosu openclaw git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" || echo "[git-auth] WARN: could not add ssh insteadOf rewrite" >&2
   echo "[git-auth] configured github.com credentials for openclaw user"
 else
   echo "[git-auth] WARNING: no S2_GITHUB_TOKEN/GITHUB_TOKEN set -> git clone/push will be unauthenticated" >&2
