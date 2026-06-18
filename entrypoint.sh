@@ -16,6 +16,33 @@ pkill -f openclaw-gateway 2>/dev/null || true
 rm -f "$STATE_DIR"/*.lock 2>/dev/null || true
 sleep 1
 
+# --- Seam precondition: the real gbrain clone MUST be in the image -----------
+# The Dockerfile clones gbrain @ ffac8ce to /opt/gbrain so the boot-time
+# `skillpack scaffold` (further down) can copy the bundled SKILL.md files into
+# the agent workspace. If /opt/gbrain is ABSENT, the image was built WITHOUT the
+# seam — a stale/cached build, a "Redeploy" of an old image, or a build that
+# skipped the clone. FAIL LOUD here instead of silently degrading to the shim-
+# only path and leaving the heavy-file-ingest seam broken with no signal (the
+# scaffold block's own `command -v bun` else-branch is the soft case; a missing
+# clone is a hard mis-build). Same fail-loud discipline as the gbrain-mcp
+# schema-pack guard. A correct build always carries /opt/gbrain, so this never
+# trips on a healthy deploy — when it DOES trip, the running image predates the
+# Dockerfile change and the fix is to rebuild current main HEAD (Deploy the
+# latest commit, not Redeploy).
+if [ ! -d /opt/gbrain ]; then
+  echo "========================================================================" >&2
+  echo "[entrypoint] FATAL: /opt/gbrain is missing — this image was built WITHOUT the" >&2
+  echo "[entrypoint] gbrain skillpack seam (the Dockerfile 'git clone .../gbrain' step" >&2
+  echo "[entrypoint] did not land). The running image predates the seam OR a stale build" >&2
+  echo "[entrypoint] cache was served. Rebuild from the CURRENT main HEAD (Deploy the" >&2
+  echo "[entrypoint] latest commit — NOT Redeploy) and confirm the BUILD log shows the" >&2
+  echo "[entrypoint] skill list + '[build] gbrain skillpack subcommand verified'." >&2
+  echo "[entrypoint] Refusing to boot a half-applied seam." >&2
+  echo "========================================================================" >&2
+  exit 1
+fi
+echo "[entrypoint] ✅ seam precondition OK: /opt/gbrain present (gbrain skillpack source)"
+
 # --- Apply secrets from env vars on every boot (idempotent) ---
 # Anthropic key -> both agents' auth-profiles.json (rotation = redeploy, no SSH)
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then

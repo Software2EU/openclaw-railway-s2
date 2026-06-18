@@ -190,7 +190,8 @@ RUN git clone https://github.com/garrytan/gbrain.git /opt/gbrain \
     && git checkout "$GBRAIN_REF" \
     && bun install \
     && echo "[build] real gbrain @ $GBRAIN_REF cloned to /opt/gbrain for skillpack scaffold" \
-    && bun /opt/gbrain/src/cli.ts skillpack list >/dev/null \
+    && echo "[build] gbrain bundled skills (proves the skillpack subcommand + this layer ran):" \
+    && bun /opt/gbrain/src/cli.ts skillpack list \
     && echo "[build] gbrain skillpack subcommand verified"
 
 ENV PORT=8080
