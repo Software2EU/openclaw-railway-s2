@@ -169,6 +169,30 @@ RUN node -e ' \
   console.log("[build] injected diff-size scope guard into review SKILL.md before " + anchor.trim()); \
 '
 
+# === S2: Real gbrain @ ffac8ce — bundle source for `skillpack scaffold` ONLY =
+# The container's runtime brain path is UNTOUCHED: the gbrain HTTP shim
+# (entrypoint.sh, /usr/local/bin/gbrain) + the mcp__gbrain__* tools stay exactly
+# as they are. This clone is installed ALONGSIDE the shim at /opt/gbrain and is
+# NEVER put on PATH as `gbrain`, so every existing shim consumer (workflows,
+# README docs) is unaffected. Its sole purpose is to expose the `skillpack`
+# subcommand the shim lacks, so the entrypoint can copy the bundled SKILL.md
+# files into the agent workspace.
+#
+# Pinned to the SAME SHA as the gbrain-mcp engine (ffac8ce) so the scaffolded
+# skill files match the running engine — bump in lockstep with gbrain-mcp's
+# GBRAIN_REF. `gbrain skillpack scaffold` is engine-less (CLI_ONLY, dispatched
+# before createEngine in cli.ts), so it needs no DB/config to run. bun is
+# already installed above (the GStack step); we reuse it.
+USER root
+ARG GBRAIN_REF=ffac8ce0f4d405f49dcad6c0c97b6cb0fca38e0e
+RUN git clone https://github.com/garrytan/gbrain.git /opt/gbrain \
+    && cd /opt/gbrain \
+    && git checkout "$GBRAIN_REF" \
+    && bun install \
+    && echo "[build] real gbrain @ $GBRAIN_REF cloned to /opt/gbrain for skillpack scaffold" \
+    && bun /opt/gbrain/src/cli.ts skillpack list >/dev/null \
+    && echo "[build] gbrain skillpack subcommand verified"
+
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
 

@@ -275,6 +275,39 @@ for d in "$STATE_DIR"/agents/*/; do
   [ -d "$d" ] && apply_workflows_pointer "${d%/}/AGENTS.md"
 done
 
+# --- Scaffold gbrain bundled skills into the agent workspace (idempotent) ----
+# The runtime brain path (the /usr/local/bin/gbrain shim + mcp__gbrain__* tools)
+# is untouched. /opt/gbrain is the real gbrain @ ffac8ce (Dockerfile), present
+# ONLY so `skillpack scaffold` can copy these SKILL.md files into the agent
+# workspace — the shim has no `skillpack` command. `scaffold` is additive and
+# refuses to overwrite, so re-running every boot is a no-op (durable across
+# redeploys: /data is the Railway volume). Each call is `|| echo` non-fatal so a
+# missing skill / already-present workspace can NEVER crash-loop the container
+# (entrypoint runs under `set -e` on a persistent volume — see quirk #8). The
+# agent EXECUTES these via the already-wired mcp__gbrain__* tools; this step only
+# puts the instructions where the agent can read them.
+GBRAIN_SRC=/opt/gbrain
+GBRAIN_SKILLS="voice-note-ingest concept-synthesis brain-pdf media-ingest meeting-ingestion perplexity-research"
+if [ -d "$GBRAIN_SRC" ] && command -v bun >/dev/null 2>&1; then
+  mkdir -p "$WORKSPACE_DIR/skills"
+  for s in $GBRAIN_SKILLS; do
+    if ( cd "$GBRAIN_SRC" && bun src/cli.ts skillpack scaffold "$s" --workspace "$WORKSPACE_DIR" ) >/dev/null 2>&1; then
+      echo "[gbrain-skillpack] scaffolded $s -> $WORKSPACE_DIR/skills/$s"
+    else
+      echo "[gbrain-skillpack] WARN: scaffold $s skipped (already present or failed) — non-fatal" >&2
+    fi
+  done
+  # The agent runs as openclaw; hand it ownership of whatever landed.
+  chown -R openclaw:openclaw "$WORKSPACE_DIR/skills" 2>/dev/null || true
+  # perplexity-research is credential-gated: the SKILL.md is now present, but it
+  # does nothing until PERPLEXITY_API_KEY is set on this service. The other five
+  # need no extra credential (they use the already-wired mcp__gbrain__* tools).
+  [ -n "${PERPLEXITY_API_KEY:-}" ] \
+    || echo "[gbrain-skillpack] NOTE: PERPLEXITY_API_KEY unset — perplexity-research scaffolded but inert until it is set" >&2
+else
+  echo "[gbrain-skillpack] NOTE: /opt/gbrain or bun missing — skipping skill scaffold (shim-only brain path unaffected)" >&2
+fi
+
 # --- Skill preflight: FAIL LOUDLY unless Claude Code + real gstack skills exist
 # gstack skills are Claude Code skills run via ACP. The worker is only able to
 # run a real skill if BOTH (a) `claude` resolves on PATH and (b) gstack actually
