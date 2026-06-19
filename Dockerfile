@@ -178,13 +178,15 @@ RUN node -e ' \
 # subcommand the shim lacks, so the entrypoint can copy the bundled SKILL.md
 # files into the agent workspace.
 #
-# Pinned to the SAME SHA as the gbrain-mcp engine (ffac8ce) so the scaffolded
-# skill files match the running engine — bump in lockstep with gbrain-mcp's
-# GBRAIN_REF. `gbrain skillpack scaffold` is engine-less (CLI_ONLY, dispatched
-# before createEngine in cli.ts), so it needs no DB/config to run. bun is
-# already installed above (the GStack step); we reuse it.
+# Pinned to the SAME SHA as the gbrain-mcp engine so the scaffolded skill files
+# match the running engine — bump in LOCKSTEP with gbrain-mcp's GBRAIN_REF.
+# CONVERGENCE: moved off ffac8ce (schema ≤107) to gbrain v0.42.1.0 (eefe8b57,
+# schema 111) so the whole system runs ONE engine version = the prod brain's
+# schema. `gbrain skillpack scaffold` is engine-less (CLI_ONLY, dispatched before
+# createEngine in cli.ts), so it needs no DB/config to run. bun is already
+# installed above (the GStack step); we reuse it.
 USER root
-ARG GBRAIN_REF=ffac8ce0f4d405f49dcad6c0c97b6cb0fca38e0e
+ARG GBRAIN_REF=eefe8b5741c27e59bf65198d46e3dfe5bfa70ce9
 RUN git clone https://github.com/garrytan/gbrain.git /opt/gbrain \
     && cd /opt/gbrain \
     && git checkout "$GBRAIN_REF" \
