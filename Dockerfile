@@ -58,6 +58,12 @@ COPY src ./src
 COPY gstack ./gstack
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 
+# Install Playwright as a Node module so the kb-image-import skill can
+# `require("playwright")` directly (the system Chromium is already cached
+# above). Pinned to the major already used by the stage-1 download.
+RUN npm install -g playwright@latest \
+    && node -e "console.log('[build] playwright global:', require('playwright/package.json').version)"
+
 RUN useradd -m -s /bin/bash openclaw \
     && chown -R openclaw:openclaw /app \
     && mkdir -p /data && chown openclaw:openclaw /data \

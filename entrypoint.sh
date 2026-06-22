@@ -272,7 +272,30 @@ seed_workflow_block() {
 }
 seed_workflow_block /app/src/workflows/demo-content-factory.md s2:content-factory-demo "demo workflows (5)"
 seed_workflow_block /app/src/workflows/pptx-content-factory.md s2:content-factory-pptx "pptx workflows (5)"
+seed_workflow_block /app/src/workflows/kb-image-import.md s2:kb-image-import "kb-image-import (1)"
 chown openclaw:openclaw "$WORKFLOWS_FILE" 2>/dev/null || true
+
+# --- Seed the kb-image-import skill into the workspace (durable across redeploys) ---
+# The dashboard dispatches a Node script baked into the image at
+# /app/src/skills/kb-image-import/run.js. The dispatch prompt looks first at
+# /data/workspace/skills/kb-image-import/run.js (the persistent volume copy),
+# falling back to the image copy. Seeding into the volume gives the operator a
+# stable, durable path AND survives a Railway "Redeploy" of a stale image. The
+# copy is idempotent — `cp -f` overwrites, which is harmless because the script
+# is read-only from the agent's perspective.
+KB_SKILL_SRC=/app/src/skills/kb-image-import
+KB_SKILL_DST="$WORKSPACE_DIR/skills/kb-image-import"
+if [ -d "$KB_SKILL_SRC" ]; then
+  mkdir -p "$KB_SKILL_DST"
+  cp -f "$KB_SKILL_SRC/run.js" "$KB_SKILL_DST/run.js" 2>/dev/null \
+    && echo "[kb-image-import] seeded run.js into $KB_SKILL_DST" \
+    || echo "[kb-image-import] WARN: could not seed run.js (non-fatal)" >&2
+  cp -f "$KB_SKILL_SRC/SKILL.md" "$KB_SKILL_DST/SKILL.md" 2>/dev/null || true
+  chmod +x "$KB_SKILL_DST/run.js" 2>/dev/null || true
+  chown -R openclaw:openclaw "$KB_SKILL_DST" 2>/dev/null || true
+else
+  echo "[kb-image-import] WARN: $KB_SKILL_SRC missing in image — skill unavailable; rebuild from main HEAD" >&2
+fi
 
 # Point AGENTS.md (workspace + each agent) at WORKFLOWS.md so it auto-loads.
 apply_workflows_pointer() {
