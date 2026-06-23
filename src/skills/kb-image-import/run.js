@@ -142,12 +142,24 @@ function writeResumeState(doneSet) {
 async function fetchWorkList() {
   if (!BRAIN_URL) throw new Error("BRAIN_URL is unset");
   if (!BEARER) throw new Error("BRAIN_BEARER_TOKEN is unset");
-  const res = await fetch(`${BRAIN_URL}/api/wissen/zoho/image-refs?pending=true`, {
+  const endpoint = `${BRAIN_URL}/api/wissen/zoho/image-refs?pending=true`;
+  log("info", "work-list GET", { endpoint, bearerLen: BEARER.length });
+  const res = await fetch(endpoint, {
     method: "GET",
     headers: { Authorization: `Bearer ${BEARER}` },
   });
   if (!res.ok) {
     const text = await res.text();
+    // A 401/403/409 here is almost always a KB_IMAGE_UPLOAD_SECRET mismatch
+    // between this OpenClaw container's env and the dashboard's env — surface
+    // it loudly so the operator can correlate it with the dashboard secret.
+    if (res.status === 401 || res.status === 403 || res.status === 409) {
+      throw new Error(
+        `work-list fetch ${res.status}: ${text.slice(0, 200)}. ` +
+          `Almost certainly KB_IMAGE_UPLOAD_SECRET differs between OpenClaw and the dashboard — ` +
+          `verify both envs hold the SAME value.`,
+      );
+    }
     throw new Error(`work-list fetch failed: HTTP ${res.status} — ${text.slice(0, 200)}`);
   }
   return res.json();
@@ -161,7 +173,8 @@ async function uploadImage(item, bytes, contentType) {
     bytes: buf.toString("base64"),
     contentType,
   });
-  const res = await fetch(`${BRAIN_URL}/api/wissen/zoho/image-upload`, {
+  const endpoint = `${BRAIN_URL}/api/wissen/zoho/image-upload`;
+  const res = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${BEARER}` },
     body,
@@ -171,6 +184,13 @@ async function uploadImage(item, bytes, contentType) {
     let j = null;
     try { j = JSON.parse(text); } catch { /* not JSON */ }
     const reason = (j && j.error && j.error.message) || text.slice(0, 200);
+    // 401/403/409 here is the same SECRET MISMATCH signal as the work-list path.
+    if (res.status === 401 || res.status === 403 || res.status === 409) {
+      throw new Error(
+        `upload ${res.status} at ${endpoint}: ${reason}. ` +
+          `Verify KB_IMAGE_UPLOAD_SECRET matches between OpenClaw and the dashboard.`,
+      );
+    }
     throw new Error(`upload failed: HTTP ${res.status} — ${reason}`);
   }
   return JSON.parse(text);
