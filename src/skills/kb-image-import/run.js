@@ -44,24 +44,36 @@
 const fs = require("fs");
 const path = require("path");
 
-// Resolve the chromium binary inside the OpenClaw image. Playwright is
-// pre-installed as a global package — require resolution would fail without an
-// explicit nodepath. Try the standard locations.
+// Resolve the playwright module. The OpenClaw image already carries playwright
+// — installed by gstack at $GSTACK_DIR/node_modules/playwright (the
+// `bun install` step in the Dockerfile) — and Chromium binaries at the
+// openclaw user's playwright cache. We DO NOT re-install playwright; instead
+// we require() it by explicit path. Honour an env override
+// (PLAYWRIGHT_NODE_MODULE) so an operator can point at a different install
+// (e.g. a workspace-local one) without touching the script.
 function resolvePlaywright() {
+  const override = process.env.PLAYWRIGHT_NODE_MODULE;
   const candidates = [
-    "playwright", // when run from a workspace that has it installed
+    ...(override ? [override] : []),
+    "/home/openclaw/.claude/skills/gstack/node_modules/playwright", // canonical: gstack's install
+    "playwright", // fall back to normal resolution if the script runs in a workspace with its own
     "/usr/local/lib/node_modules/playwright",
     "/home/openclaw/.bun/install/global/node_modules/playwright",
   ];
+  const errors = [];
   for (const c of candidates) {
     try {
       // eslint-disable-next-line global-require
       return require(c);
-    } catch {
-      /* try next */
+    } catch (e) {
+      errors.push(`${c}: ${e.message || e}`);
     }
   }
-  throw new Error("playwright module not found — install it globally or in the workspace");
+  throw new Error(
+    "playwright module not found. Tried:\n  - " + errors.join("\n  - ") +
+      "\nExpected gstack's install at /home/openclaw/.claude/skills/gstack/node_modules/playwright — " +
+      "verify the gstack build step ran (Dockerfile `bun install` in $GSTACK_DIR).",
+  );
 }
 
 const BRAIN_URL = (process.env.BRAIN_URL || "").replace(/\/+$/, "");

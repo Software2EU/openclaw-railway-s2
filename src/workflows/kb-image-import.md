@@ -27,6 +27,22 @@ Capture the full stdout + stderr and summarise the last-line JSON outcome
 Do NOT spawn subagents. Do NOT call any workflow other than this script.
 ```
 
+## Playwright runtime (already installed, no extra deps)
+
+The OpenClaw image already carries everything this skill needs:
+
+- Chromium binaries at `/home/openclaw/.cache/ms-playwright` (Dockerfile stage-1
+  `npx playwright install` + the copy at lines 95-97).
+- `playwright` as a Node module at
+  `/home/openclaw/.claude/skills/gstack/node_modules/playwright` (gstack's
+  `bun install` step in the Dockerfile).
+
+The script resolves the module by explicit path (see `resolvePlaywright()` in
+`run.js`). An operator can override via `PLAYWRIGHT_NODE_MODULE=<absolute path>`
+if gstack's layout ever moves. There is NO `npm install playwright` step in the
+image — we deliberately reuse the existing install instead of duplicating
+~150 MB of node_modules.
+
 ## Required environment
 
 | Env var                   | Required | Purpose                                                                                                                       |

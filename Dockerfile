@@ -58,11 +58,14 @@ COPY src ./src
 COPY gstack ./gstack
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 
-# Install Playwright as a Node module so the kb-image-import skill can
-# `require("playwright")` directly (the system Chromium is already cached
-# above). Pinned to the major already used by the stage-1 download.
-RUN npm install -g playwright@latest \
-    && node -e "console.log('[build] playwright global:', require('playwright/package.json').version)"
+# NOTE on Playwright: do NOT npm-install playwright again. The image already
+# carries:
+#   - Chromium binaries at /home/openclaw/.cache/ms-playwright (stage-1 +
+#     line 95-97 copy)
+#   - playwright as a Node module at $GSTACK_DIR/node_modules/playwright
+#     (gstack's `bun install` + `bunx playwright install chromium` step below)
+# The kb-image-import skill's run.js resolves playwright from the gstack
+# install path — see resolvePlaywright() in src/skills/kb-image-import/run.js.
 
 RUN useradd -m -s /bin/bash openclaw \
     && chown -R openclaw:openclaw /app \
