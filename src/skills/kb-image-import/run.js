@@ -91,6 +91,11 @@ const BEARER = process.env.BRAIN_BEARER_TOKEN || "";
 const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 const POLITE_DELAY_MS = Number(process.env.POLITE_DELAY_MS) > 0 ? Number(process.env.POLITE_DELAY_MS) : 750;
 const IMPORT_LIMIT = Number(process.env.IMPORT_LIMIT) > 0 ? Number(process.env.IMPORT_LIMIT) : 0;
+// Bump this string on every behavioural change. The startup `[kb-image-import]
+// version` log line is what the operator greps to confirm which bytes are
+// live on /data — if it doesn't match the expected tag, Railway's image
+// build cache served stale and the operator must pull raw run.js manually.
+const RUN_JS_VERSION = "2026-06-25-pr17-login-primary-verbose-article-probe";
 const STORAGE_STATE_PATH = process.env.ZOHO_STORAGE_STATE_PATH || "";
 const ZOHO_EMAIL = process.env.ZOHO_EMAIL || "";
 const ZOHO_PASSWORD = process.env.ZOHO_PASSWORD || "";
@@ -292,81 +297,177 @@ async function loginToZoho(browser) {
         `email+password only (no MFA/SSO).`,
     );
   }
-  log("info", "logging into Zoho Learn from container", { email: ZOHO_EMAIL, dataCenter: ZOHO_DATA_CENTER });
+  log("info", "[login] starting in-container Zoho login", {
+    email: ZOHO_EMAIL,
+    dataCenter: ZOHO_DATA_CENTER,
+    note: "this log line MUST appear when ZOHO_EMAIL/ZOHO_PASSWORD are set — if it's missing, the run.js on /data is stale (pre-PR17)",
+  });
   const context = await browser.newContext();
   const page = await context.newPage();
-  try {
-    const learnOrigin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
-    // Navigate to Learn first. If unauthed (which we always are on a fresh
-    // context), Zoho redirects to accounts.zoho.<dc>/signin?servicename=…
-    // with the SSO redirect-back wired up — completing login lands us back
-    // on Learn, ready to fetch images.
-    await page.goto(learnOrigin, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    let url = page.url();
-    log("info", "initial navigation", { url, redirectedToLogin: url.includes("accounts.zoho") });
-    if (!url.includes("accounts.zoho") && !url.includes("signin")) {
-      log("info", "no login redirect — context already authed (unexpected on a fresh context)");
-      await page.close();
-      return context;
-    }
-    // Fill EMAIL. Cover the known Zoho selectors + a generic type="email" fallback.
-    const emailSelector = 'input[name="LOGIN_ID"], input#login_id, input[type="email"]';
-    await page.waitForSelector(emailSelector, { timeout: 15_000, state: "visible" });
-    await page.fill(emailSelector, ZOHO_EMAIL);
-    log("info", "filled email");
-    // Detect ONE-step vs TWO-step layout: if the password field is already
-    // visible right after filling the email, it's one-step. Otherwise it's
-    // two-step (a Next button advances to a second screen with the password).
-    const passwordSelector = 'input[name="PASSWORD"], input#password, input[type="password"]';
-    let isOneStep = false;
+  // Detect challenge / unusual-activity / CAPTCHA — Zoho occasionally serves
+  // these on unfamiliar IPs. We surface them loudly so an unattended fail is
+  // never silent.
+  const detectChallenge = async (where) => {
     try {
-      await page.waitForSelector(passwordSelector, { timeout: 1_500, state: "visible" });
-      isOneStep = true;
-    } catch {
-      isOneStep = false;
+      const sniff = await page.evaluate(() => {
+        const title = document.title || "";
+        const html = document.body ? document.body.innerText || "" : "";
+        const hasRecaptcha = !!document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], div.g-recaptcha, [class*="captcha"]');
+        const isChallenge = /captcha|recaptcha|hcaptcha|unusual activity|verify it'?s you|device verification|sign-in attempt|OTP|verification code|two[-\s]?factor|2FA|authenticator/i.test(`${title}\n${html}`);
+        return { title, isChallenge, hasRecaptcha };
+      });
+      if (sniff.isChallenge || sniff.hasRecaptcha) {
+        log("warn", "[login] challenge detected", { where, url: page.url(), pageTitle: sniff.title, hasRecaptcha: sniff.hasRecaptcha });
+        return sniff;
+      }
+    } catch { /* DOM may not be ready; skip */ }
+    return null;
+  };
+  try {
+    // Navigate DIRECTLY to the Zoho accounts signin page (not via learn.zoho —
+    // the redirect chain through locale pages was costing us a step and the
+    // first run could miss the form selectors entirely). The `servicename=Learn`
+    // hint asks Zoho to redirect back to Learn after successful login.
+    const learnOrigin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+    const signinUrl = `https://accounts.zoho.${ZOHO_DATA_CENTER}/signin?servicename=ZohoLearn&serviceurl=${encodeURIComponent(learnOrigin)}`;
+    log("info", "[login] navigating to signin", { signinUrl });
+    await page.goto(signinUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    log("info", "[login] page URL after initial nav", { url: page.url(), pageTitle: await page.title().catch(() => "?") });
+    await detectChallenge("after-initial-nav");
+    // Some Zoho data centers redirect /signin → a /nl/ or /de/ locale page
+    // before showing the form. If the URL drifted to a locale page that lacks
+    // the form, re-navigate explicitly to the bare /signin and force English.
+    if (!/\/signin(\?|$)/.test(page.url())) {
+      log("info", "[login] URL drifted off /signin — re-navigating");
+      await page.goto(signinUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      log("info", "[login] URL after re-navigation", { url: page.url() });
     }
-    if (!isOneStep) {
-      // TWO-step: click Next and wait for the password field.
-      const nextSelector = 'button#nextbtn, button[type="submit"], input#nextbtn';
-      await page.click(nextSelector);
-      log("info", "clicked next (two-step layout)");
-      await page.waitForSelector(passwordSelector, { timeout: 15_000, state: "visible" });
-    } else {
-      log("info", "one-step layout — password field already visible");
+    // EMAIL field — try each known Zoho selector and report which matched.
+    const emailSelectors = [
+      'input[name="LOGIN_ID"]',
+      'input#login_id',
+      'input[type="email"]',
+      'input[name="email"]',
+    ];
+    let matchedEmailSel = null;
+    for (const sel of emailSelectors) {
+      const el = await page.$(sel).catch(() => null);
+      if (el) {
+        const visible = await el.isVisible().catch(() => false);
+        if (visible) { matchedEmailSel = sel; break; }
+      }
     }
-    // Fill PASSWORD and submit.
-    await page.fill(passwordSelector, ZOHO_PASSWORD);
-    log("info", "filled password");
-    const submitSelector = 'button#nextbtn, button[type="submit"], input#nextbtn';
-    await page.click(submitSelector);
-    log("info", "submitted login form");
-    // Wait for the SSO redirect to land back on Learn (away from accounts.zoho).
+    if (!matchedEmailSel) {
+      // Wait briefly in case the form is still rendering, then re-probe.
+      try { await page.waitForSelector(emailSelectors.join(", "), { timeout: 10_000, state: "visible" }); } catch { /* fall through */ }
+      for (const sel of emailSelectors) {
+        const el = await page.$(sel).catch(() => null);
+        if (el && (await el.isVisible().catch(() => false))) { matchedEmailSel = sel; break; }
+      }
+    }
+    log("info", "[login] email field probe", { matchedEmailSelector: matchedEmailSel || "(none)" });
+    if (!matchedEmailSel) {
+      await detectChallenge("no-email-field");
+      throw new Error(
+        `email field not found on ${page.url()}. ` +
+          `Zoho may be serving a CAPTCHA / unusual-activity challenge instead of the login form ` +
+          `(check the [login] challenge detected log line if present), or the data-center / locale ` +
+          `is returning a layout we don't recognise. Page title: "${await page.title().catch(() => "?")}"`,
+      );
+    }
+    await page.fill(matchedEmailSel, ZOHO_EMAIL);
+    log("info", "[login] filled email", { selector: matchedEmailSel });
+    // ONE-step vs TWO-step layout detection.
+    const passwordSelectors = [
+      'input[name="PASSWORD"]',
+      'input#password',
+      'input[type="password"]',
+    ];
+    let matchedPasswordSel = null;
+    for (const sel of passwordSelectors) {
+      const el = await page.$(sel).catch(() => null);
+      if (el && (await el.isVisible().catch(() => false))) { matchedPasswordSel = sel; break; }
+    }
+    log("info", "[login] password-field initial probe", {
+      matchedPasswordSelector: matchedPasswordSel || "(none — two-step layout)",
+      layout: matchedPasswordSel ? "one-step" : "two-step",
+    });
+    if (!matchedPasswordSel) {
+      // TWO-step: click Next, then wait for the password field.
+      const nextSelectors = ['button#nextbtn', 'input#nextbtn', 'button[type="submit"]'];
+      let matchedNextSel = null;
+      for (const sel of nextSelectors) {
+        const el = await page.$(sel).catch(() => null);
+        if (el && (await el.isVisible().catch(() => false))) { matchedNextSel = sel; break; }
+      }
+      log("info", "[login] next-button probe", { matchedNextSelector: matchedNextSel || "(none)" });
+      if (!matchedNextSel) {
+        throw new Error(`Next button not found on the two-step login form at ${page.url()}.`);
+      }
+      await page.click(matchedNextSel);
+      log("info", "[login] clicked next (two-step)", { url: page.url() });
+      await detectChallenge("after-next-click");
+      // Wait for password field to appear on the next screen.
+      try {
+        await page.waitForSelector(passwordSelectors.join(", "), { timeout: 15_000, state: "visible" });
+      } catch {
+        await detectChallenge("password-field-never-appeared");
+        throw new Error(
+          `password field never appeared after clicking Next — stuck at ${page.url()} ` +
+            `with page title "${await page.title().catch(() => "?")}". Zoho may be serving an ` +
+            `MFA / device-verification / CAPTCHA challenge instead of the password screen.`,
+        );
+      }
+      for (const sel of passwordSelectors) {
+        const el = await page.$(sel).catch(() => null);
+        if (el && (await el.isVisible().catch(() => false))) { matchedPasswordSel = sel; break; }
+      }
+      log("info", "[login] password-field probe after next", { matchedPasswordSelector: matchedPasswordSel || "(none)", url: page.url() });
+      if (!matchedPasswordSel) {
+        throw new Error(`password field still not found after Next at ${page.url()}.`);
+      }
+    }
+    await page.fill(matchedPasswordSel, ZOHO_PASSWORD);
+    log("info", "[login] filled password", { selector: matchedPasswordSel });
+    // Submit.
+    const submitSelectors = ['button#nextbtn', 'input#nextbtn', 'button[type="submit"]'];
+    let matchedSubmitSel = null;
+    for (const sel of submitSelectors) {
+      const el = await page.$(sel).catch(() => null);
+      if (el && (await el.isVisible().catch(() => false))) { matchedSubmitSel = sel; break; }
+    }
+    log("info", "[login] submit-button probe", { matchedSubmitSelector: matchedSubmitSel || "(none)" });
+    if (!matchedSubmitSel) {
+      throw new Error(`submit button not found at ${page.url()}.`);
+    }
+    await page.click(matchedSubmitSel);
+    log("info", "[login] clicked submit", { url: page.url() });
+    // Wait for the SSO redirect back away from accounts.zoho — Zoho should
+    // redirect us to learn.zoho once auth succeeds.
     try {
       await page.waitForURL((u) => !u.host.includes("accounts.zoho") && !u.toString().includes("signin"), { timeout: 30_000 });
     } catch (e) {
       const stuckUrl = page.url();
-      // Look for an MFA / OTP / unusual-activity challenge that would block
-      // unattended completion — surface it loudly so the operator knows.
-      const looksMfa = await page.evaluate(() => {
-        const html = document.body ? document.body.innerText || "" : "";
-        return /OTP|verification|two[-\s]?factor|2FA|authenticator|verify|unusual/i.test(html);
-      }).catch(() => false);
+      const challenge = await detectChallenge("post-submit-stuck");
       throw new Error(
-        `login did not redirect away from accounts.zoho within 30s — stuck at ${stuckUrl}. ` +
-          (looksMfa
-            ? "The login page shows an MFA / OTP / verification challenge — Playwright cannot solve it unattended. Disable MFA on this account OR use a service account without 2FA."
-            : "Likely credentials rejected (verify ZOHO_EMAIL + ZOHO_PASSWORD are correct on the OpenClaw Railway env).") +
+        `login did not redirect away from accounts.zoho within 30s — stuck at ${stuckUrl}, ` +
+          `page title "${await page.title().catch(() => "?")}". ` +
+          (challenge
+            ? `Zoho is serving a CHALLENGE/CAPTCHA/MFA screen — Playwright cannot solve it unattended. ` +
+              `Use a service account without MFA/device-verification, or whitelist Railway's egress IP in Zoho's security settings.`
+            : `Likely credentials rejected — verify ZOHO_EMAIL + ZOHO_PASSWORD are correct on the OpenClaw Railway env.`) +
           ` Underlying timeout: ${String(e)}`,
       );
     }
-    log("info", "login completed", { finalUrl: page.url() });
+    log("info", "[login] redirected away from accounts.zoho", { url: page.url(), pageTitle: await page.title().catch(() => "?") });
     const finalUrl = page.url();
     if (finalUrl.includes("accounts.zoho") || finalUrl.includes("signin")) {
+      await detectChallenge("post-submit-still-on-accounts");
       throw new Error(
-        `login appeared to complete but landed at ${finalUrl} (still on the accounts host) — ` +
-          `credentials rejected, MFA challenge, or unexpected redirect chain.`,
+        `login appeared to complete but landed at ${finalUrl} (still on the accounts host).`,
       );
     }
+    log("info", "[login] login flow complete — context now holds the live Zoho session");
     await page.close();
     return context;
   } catch (e) {
@@ -376,21 +477,27 @@ async function loginToZoho(browser) {
   }
 }
 
-/** Post-login verification: navigate to Learn and assert we LAND on Learn
- *  (not redirected to login). Also assert the context now holds cookies for
- *  the Zoho Learn origin. If either check fails, throw — do NOT attempt
- *  image fetches against an unauthenticated session. */
-async function verifyAuthenticatedSession(context) {
+/** Post-login verification: TWO mandatory gates before image fetches:
+ *  (1) navigate to learn.zoho.<dc> and assert we LAND on Learn (not bounced
+ *      to login) AND the context holds cookies for the Learn origin;
+ *  (2) if a `probeUrl` is supplied (the first image URL from the work-list),
+ *      fetch it via context.request.get and assert the response is NOT login
+ *      HTML — i.e. the session actually authorises us against /scroll/
+ *      endpoints. This catches the IP-binding failure mode loudly BEFORE
+ *      we hammer Zoho with 89 cookieless fetches. */
+async function verifyAuthenticatedSession(context, probeUrl) {
   const learnOrigin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+  // (1) Navigate-to-Learn probe.
   const probePage = await context.newPage();
   try {
     const resp = await probePage.goto(learnOrigin, { waitUntil: "domcontentloaded", timeout: 15_000 });
     const finalUrl = probePage.url();
     const redirected = finalUrl.includes("accounts.zoho") || finalUrl.includes("signin");
-    log("info", "auth verification probe", {
+    log("info", "[verify] navigate-to-Learn probe", {
       origin: learnOrigin,
       status: resp ? resp.status() : null,
       finalUrl,
+      pageTitle: await probePage.title().catch(() => "?"),
       redirectedToLogin: redirected,
     });
     if (redirected) {
@@ -401,53 +508,130 @@ async function verifyAuthenticatedSession(context) {
       );
     }
     const zohoCookies = await context.cookies(learnOrigin);
-    log("info", "auth verification cookies", {
+    log("info", "[verify] cookies live for Zoho Learn origin", {
       forZohoOrigin: zohoCookies.length,
       zohoCookieNames: zohoCookies.map((c) => c.name).slice(0, 10),
     });
     if (zohoCookies.length === 0) {
       throw new Error(
-        `auth verification: 0 cookies live for ${learnOrigin} after login — ` +
-          `the login form completed but the cookie jar is empty for the Learn origin. ` +
-          `Refusing to attempt image fetches against a cookie-less context.`,
+        `auth verification: 0 cookies live for ${learnOrigin} after login.`,
       );
     }
   } finally {
     await probePage.close().catch(() => {});
   }
+  // (2) Article probe (HARD assertion the user explicitly demanded). Fetch
+  //     the FIRST image URL from the work-list via the same context.request.get
+  //     primitive the real loop will use. If the response is HTML / login HTML,
+  //     THROW — refusing to fetch 89 images against a session Zoho is rejecting.
+  if (!probeUrl) {
+    log("warn", "[verify] no probeUrl provided — skipping article probe (work-list was empty?)");
+    return;
+  }
+  let probeRes;
+  try {
+    probeRes = await context.request.get(probeUrl, {
+      headers: { Referer: `${learnOrigin}/`, Accept: "image/*,application/json;q=0.9,*/*;q=0.5" },
+    });
+  } catch (e) {
+    throw new Error(`auth verification article probe — context.request.get failed for ${probeUrl}: ${String(e)}`);
+  }
+  const probeStatus = probeRes.status();
+  const probeCt = (probeRes.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
+  const probeBody = await probeRes.body().catch(() => Buffer.alloc(0));
+  const isImage = probeCt.startsWith("image/");
+  const isJson = probeCt.includes("json");
+  const bodyPreview = probeBody.length > 0
+    ? probeBody.toString("utf8").replace(/\s+/g, " ").slice(0, 300)
+    : "(empty body)";
+  const looksLikeLoginHtml = (probeCt.includes("html") || probeCt.includes("text")) && (
+    /<input[^>]+name=["']?LOGIN_ID/i.test(bodyPreview) ||
+    /accounts\.zoho\./i.test(bodyPreview) ||
+    /Sign In|Anmelden|Log In/i.test(bodyPreview)
+  );
+  log("info", "[verify] article probe", {
+    probeUrl,
+    status: probeStatus,
+    contentType: probeCt || "(none)",
+    bytes: probeBody.length,
+    bodyPreview,
+    isImage,
+    isJson,
+    looksLikeLoginHtml,
+  });
+  if (looksLikeLoginHtml) {
+    throw new Error(
+      `in-container Zoho login FAILED verification — the post-login article probe ` +
+        `against ${probeUrl} returned LOGIN HTML (final URL would be the accounts.zoho page). ` +
+        `The session is not actually authorised against Zoho's /scroll/ endpoints. ` +
+        `Most likely cause: ZOHO_EMAIL/ZOHO_PASSWORD rejected, or Zoho is blocking ` +
+        `headless login (CAPTCHA / device-verification — see any earlier [login] challenge ` +
+        `detected log lines). Refusing to fetch 89 images against an unauthenticated session.`,
+    );
+  }
+  if (!isImage && !isJson) {
+    throw new Error(
+      `in-container Zoho login verification — article probe returned an unexpected ` +
+        `content-type "${probeCt}" (status ${probeStatus}). The session may be ` +
+        `partially authorised but not against this URL family. bodyPreview=${bodyPreview}`,
+    );
+  }
+  // Empty-body 200 JSON is the IP-binding-fail signature observed last run —
+  // Zoho returned 200 application/json with 0 bytes. Surface it loudly.
+  if (isJson && probeBody.length === 0) {
+    throw new Error(
+      `in-container Zoho login verification — article probe returned 200 ${probeCt} ` +
+        `with an EMPTY body. This is the IP-binding-fail signature: Zoho accepted the ` +
+        `request but returned no payload because the session/IP combination is rejected. ` +
+        `Either the in-container login did not actually succeed (verify the [login] ` +
+        `trace above) or Zoho is rate-limiting this account on this IP.`,
+    );
+  }
+  log("info", "[verify] article probe PASSED — session is authorised against /scroll/");
 }
 
-async function ensureAuthenticatedContext(browser) {
+async function ensureAuthenticatedContext(browser, probeUrl) {
   // PRIMARY PATH — in-container login from ZOHO_EMAIL + ZOHO_PASSWORD.
   // The session originates from Railway's egress IP = same IP every image
-  // fetch runs from, so Zoho's IP-bound /scroll/ endpoints honour it. This
-  // is the only reliable path; a laptop-captured storageState is rejected
-  // cross-IP (proven in the previous run: 45 cookies, still bounced to
-  // login on the warm-up page.goto).
+  // fetch runs from, so Zoho's IP-bound /scroll/ endpoints honour it.
   if (ZOHO_EMAIL && ZOHO_PASSWORD) {
+    // DEFENSIVE: when creds are present, NUKE any laptop-captured storageState
+    // sitting on the persistent volume. The previous run.js bytes on /data
+    // could otherwise read it on a stale-deploy and use the IP-mismatched
+    // session — the failure mode the operator just hit. Once deleted, no
+    // future invocation can fall back to the wrong file.
+    if (STORAGE_STATE_PATH && fs.existsSync(STORAGE_STATE_PATH)) {
+      try {
+        fs.unlinkSync(STORAGE_STATE_PATH);
+        log("info", "[auth] deleted stale storageState file (laptop-captured / IP-mismatched)", { path: STORAGE_STATE_PATH });
+      } catch (e) {
+        log("warn", "[auth] could not delete stale storageState (non-fatal — primary path is in-container login)", { path: STORAGE_STATE_PATH, error: String(e) });
+      }
+    }
+    log("info", "[auth] PRIMARY path = in-container Zoho login (ZOHO_EMAIL + ZOHO_PASSWORD set)");
     const context = await loginToZoho(browser);
-    await verifyAuthenticatedSession(context);
-    // Best-effort: save the resulting state for THIS container's next run
-    // (still IP-bound, so only valid as long as Railway's egress IP doesn't
-    // rotate). A subsequent run can read it back via the fallback path
-    // below for a fast start — but in-container login stays the primary.
+    // HARD assertion that the session actually works against /scroll/. Pass
+    // the first image URL from the work-list so the probe is against a REAL
+    // endpoint the loop will fetch. Throws + fails closed on any failure
+    // signature (login HTML, empty JSON, unexpected content-type).
+    await verifyAuthenticatedSession(context, probeUrl);
+    // Save the post-login storageState to disk for diagnostic re-use only
+    // (NOT used as auth — every run re-logs in).
     if (STORAGE_STATE_PATH) {
       try {
         await context.storageState({ path: STORAGE_STATE_PATH });
-        log("info", "saved post-login storageState for diagnostic re-use", { path: STORAGE_STATE_PATH });
+        log("info", "[auth] saved post-login storageState for diagnostic re-use (not used as auth)", { path: STORAGE_STATE_PATH });
       } catch (e) {
-        log("warn", "could not save post-login storageState (non-fatal)", { error: String(e) });
+        log("warn", "[auth] could not save post-login storageState (non-fatal)", { error: String(e) });
       }
     }
     return context;
   }
 
-  // FALLBACK — operator-captured storageState. KEPT only as a manual escape
-  // hatch (e.g. diagnosing a login regression). NOT the recommended path:
-  // Zoho's /scroll/ endpoints are IP-bound, so a storageState captured on
-  // any host other than Railway's egress IP will fail with login redirects.
+  // FALLBACK — operator-captured storageState. Only consulted when creds are
+  // UNSET. Loud warning so an operator who chose this path knows the IP-binding caveat.
   if (STORAGE_STATE_PATH && fs.existsSync(STORAGE_STATE_PATH)) {
-    log("warn", "no ZOHO_EMAIL/ZOHO_PASSWORD set — falling back to storageState. " +
+    log("warn", "[auth] FALLBACK = storageState (no ZOHO_EMAIL/ZOHO_PASSWORD set). " +
       "WARNING: Zoho's /scroll/ endpoints are IP-bound; a storageState captured on " +
       "any IP other than Railway's egress IP will be rejected with a login redirect. " +
       "Set ZOHO_EMAIL + ZOHO_PASSWORD on the OpenClaw Railway env for the reliable " +
@@ -473,7 +657,7 @@ async function ensureAuthenticatedContext(browser) {
           `Set ZOHO_EMAIL + ZOHO_PASSWORD instead to use the in-container login path.`,
       );
     }
-    log("info", "using storageState fallback for Zoho session", {
+    log("info", "[auth] using storageState fallback for Zoho session", {
       path: STORAGE_STATE_PATH,
       mtime: stateMtime,
       bytes: stateBytes,
@@ -481,8 +665,8 @@ async function ensureAuthenticatedContext(browser) {
       fileZohoCookieCount: zohoFileCookieCount,
     });
     const ctx = await browser.newContext({ storageState: parsedState });
-    // Verify the fallback session is actually live — same probe as the primary path.
-    await verifyAuthenticatedSession(ctx);
+    // Same hard assertion — even the fallback must pass the article probe.
+    await verifyAuthenticatedSession(ctx, probeUrl);
     return ctx;
   }
 
@@ -716,7 +900,16 @@ async function main() {
     : STORAGE_STATE_PATH && fs.existsSync(STORAGE_STATE_PATH)
       ? "storageState-fallback"
       : "none-configured";
+  // VERSION line — grep this first to confirm which run.js bytes are LIVE.
+  // If the version string doesn't match the expected PR tag, Railway's image
+  // build cache served stale bytes — the operator must pull raw run.js from
+  // GitHub into /data/workspace/skills/kb-image-import/run.js and restart.
+  log("info", `[kb-image-import] version ${RUN_JS_VERSION}`, {
+    version: RUN_JS_VERSION,
+    note: "if you don't see this line, the run.js on /data is older than PR#17 and the in-container-login code will NOT execute",
+  });
   log("info", "kb-image-import start", {
+    version: RUN_JS_VERSION,
     BRAIN_URL,
     dryRun: DRY_RUN,
     dataCenter: ZOHO_DATA_CENTER,
@@ -759,8 +952,13 @@ async function main() {
   const playwright = resolvePlaywright();
   const browser = await playwright.chromium.launch({ headless: true });
   let context;
+  // Pull the first image URL from the work-list to use as the post-login
+  // article-probe target — the hard assertion that the session is actually
+  // authorised against /scroll/ endpoints before we fetch 89 images.
+  const probeUrl = workList.items?.[0]?.imageRefs?.[0]?.url || null;
+  log("info", "[auth] article probe URL chosen from work-list", { probeUrl: probeUrl || "(none)" });
   try {
-    context = await ensureAuthenticatedContext(browser);
+    context = await ensureAuthenticatedContext(browser, probeUrl);
   } catch (e) {
     log("error", "Zoho authentication failed", { error: String(e) });
     await browser.close().catch(() => {});
