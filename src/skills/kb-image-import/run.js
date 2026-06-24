@@ -254,8 +254,51 @@ async function uploadImage(item, bytes, contentType) {
 async function ensureAuthenticatedContext(browser) {
   // 1) storageState path is the operator-friendly path — capture once, reuse forever.
   if (STORAGE_STATE_PATH && fs.existsSync(STORAGE_STATE_PATH)) {
-    log("info", "using storageState for Zoho session", { path: STORAGE_STATE_PATH });
-    return browser.newContext({ storageState: STORAGE_STATE_PATH });
+    // PROOF: log the file's mtime + cookie count so the run-log shows whether
+    // a FRESH state file is in use. A stale capture is the single biggest
+    // recurring failure mode; this answers "is the file the operator just
+    // re-captured actually the one we're loading?" in ONE log line.
+    let stateMtime = null;
+    let stateBytes = null;
+    let cookieCount = null;
+    let originCount = null;
+    let zohoOriginCount = null;
+    try {
+      const st = fs.statSync(STORAGE_STATE_PATH);
+      stateMtime = st.mtime.toISOString();
+      stateBytes = st.size;
+      const parsed = JSON.parse(fs.readFileSync(STORAGE_STATE_PATH, "utf8"));
+      const cookies = Array.isArray(parsed.cookies) ? parsed.cookies : [];
+      cookieCount = cookies.length;
+      const origins = Array.isArray(parsed.origins) ? parsed.origins : [];
+      originCount = origins.length;
+      zohoOriginCount = cookies.filter((c) =>
+        typeof c.domain === "string" && c.domain.toLowerCase().includes("zoho"),
+      ).length;
+    } catch (e) {
+      log("warn", "storageState read for diagnostics failed", { path: STORAGE_STATE_PATH, error: String(e) });
+    }
+    log("info", "using storageState for Zoho session", {
+      path: STORAGE_STATE_PATH,
+      mtime: stateMtime,
+      bytes: stateBytes,
+      cookieCount,
+      originCount,
+      zohoCookieCount: zohoOriginCount,
+    });
+    const ctx = await browser.newContext({ storageState: STORAGE_STATE_PATH });
+    // Confirm cookies actually landed in the context (the JSON had them; the
+    // context loaded them; both must be true for the session to work).
+    try {
+      const liveCookies = await ctx.cookies();
+      log("info", "context cookies loaded", {
+        total: liveCookies.length,
+        zoho: liveCookies.filter((c) => (c.domain || "").toLowerCase().includes("zoho")).length,
+      });
+    } catch (e) {
+      log("warn", "context cookies probe failed", { error: String(e) });
+    }
+    return ctx;
   }
   // 2) Headless login from creds — only works if Zoho One bypasses MFA for the user.
   if (ZOHO_EMAIL && ZOHO_PASSWORD) {
@@ -297,45 +340,126 @@ async function ensureAuthenticatedContext(browser) {
   );
 }
 
-async function fetchOneImage(context, item) {
-  // Use the authenticated browser context's request to fetch the image — this
-  // preserves cookies + reuses the same IP the browser would. We DO NOT
-  // navigate the page (a viewImage.do JSON payload would render as text in a
-  // tab); we issue an XHR-style GET inside the context.
+/** The Zoho Learn origin (e.g. https://learn.zoho.eu). Used as Referer/Origin
+ *  headers so the session-bound endpoints accept the request. The dashboard's
+ *  work-list passes absolute URLs against this origin; deriving the origin from
+ *  the URL itself (not from ZOHO_DATA_CENTER) keeps this robust across DCs. */
+function deriveOrigin(absoluteUrl) {
+  try {
+    return new URL(absoluteUrl).origin;
+  } catch {
+    return `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+  }
+}
+
+/** GET an authenticated-context URL with the headers a real browser sends when
+ *  rendering an image inside a Zoho Learn page. The bare `context.request.get`
+ *  attaches cookies but DOES NOT add Referer/Origin/X-Requested-With — Zoho's
+ *  scroll endpoints can interpret a missing Referer as a cross-context fetch and
+ *  refuse with HTML/JSON error. Pass these explicitly so the request matches
+ *  the live browser navigation pattern. */
+async function authedGet(context, url, opts = {}) {
+  const origin = deriveOrigin(url);
+  const headers = {
+    Referer: opts.referer || `${origin}/`,
+    Origin: origin,
+    Accept: opts.accept || "image/*,application/json;q=0.9,*/*;q=0.5",
+    "X-Requested-With": "XMLHttpRequest",
+    ...(opts.headers || {}),
+  };
+  return context.request.get(url, { headers });
+}
+
+/** Truncate a Buffer/string to `n` chars of safe ASCII-ish preview so the log
+ *  line stays one row (multi-MB image bytes never get dumped). */
+function previewBody(buf, n = 240) {
+  if (!buf) return "";
+  const s = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
+  // Collapse newlines so the log JSON stays a single record; truncate hard.
+  return s.replace(/\s+/g, " ").slice(0, n);
+}
+
+async function fetchOneImage(context, item, diagnostics) {
+  // 1) Issue the request inside the authenticated context, WITH explicit
+  //    Referer + Origin headers. A bare GET drops these — Zoho's
+  //    `/scroll/viewImage.do` + `/scroll/viewFile.do` are session-authenticated
+  //    AND request-context-aware, so a missing Referer is a recurring failure
+  //    mode in addition to true session expiry.
   let res;
   try {
-    res = await context.request.get(item.url);
+    res = await authedGet(context, item.url);
   } catch (e) {
     throw new Error(`network error fetching ${item.url}: ${String(e)}`);
   }
   const status = res.status();
   const ct = (res.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
   const buf = await res.body();
-  // Three shapes from Zoho:
-  //   image/* → bytes
-  //   application/json → viewImage.do envelope { url } or { data: base64 }
-  //   text/html → expired session (re-capture storageState)
-  if (ct.startsWith("image/")) {
+
+  // 2) Diagnostic: every non-image response is logged with the EXACT URL + status
+  //    + content-type + the first ~240 chars of the raw body. Capped at
+  //    DIAG_LIMIT records so a long run doesn't drown the logs, but the first
+  //    few failures are always answerable from a single grep ("image diagnostic").
+  const isImage = ct.startsWith("image/");
+  if (!isImage && diagnostics && diagnostics.remaining > 0) {
+    log("info", "image diagnostic", {
+      requestUrl: item.url,
+      status,
+      contentType: ct || "(none)",
+      bodyPreview: previewBody(buf),
+      articleId: item.articleId,
+      ref: item.ref,
+    });
+    diagnostics.remaining -= 1;
+  }
+
+  // 3) Three shapes from Zoho:
+  //    image/*          → bytes
+  //    application/json → viewImage.do envelope { url } or { data: base64 }
+  //                       OR an honest Zoho error envelope ({errorCode, status})
+  //    text/html        → either an expired-session login redirect, OR (more
+  //                       commonly with a FRESH session) a request-construction
+  //                       fault — wrong URL pattern, missing Referer, etc.
+  if (isImage) {
     return { bytes: buf, contentType: ct, endpoint: item.url, status };
   }
   if (ct.includes("json")) {
+    const rawText = buf.toString("utf8");
     let env;
     try {
-      env = JSON.parse(buf.toString("utf8"));
+      env = JSON.parse(rawText);
     } catch {
-      throw new Error(`viewImage.do returned non-parseable JSON at ${item.url}`);
+      throw new Error(`Zoho returned non-parseable JSON at ${item.url}: ${previewBody(rawText)}`);
+    }
+    // Honest error envelope — surface verbatim. URL_RULE_NOT_CONFIGURED is the
+    // tell that Zoho doesn't recognize the URL pattern (NOT auth) — usually means
+    // the dashboard built a URL the modern Zoho Learn API doesn't accept.
+    const errCode = env.errorCode || env.error_code || env.code;
+    const errStatus = env.status || env.statusCode;
+    if ((errCode && String(errCode).toUpperCase() !== "SUCCESS") || (errStatus && /failure|error/i.test(String(errStatus)))) {
+      const reason = env.message || env.description || env.reason || rawText.slice(0, 200);
+      throw new Error(
+        `Zoho rejected ${item.url} — code=${errCode || "(none)"} status=${errStatus || "(none)"} reason=${reason}. ` +
+          (String(errCode).toUpperCase() === "URL_RULE_NOT_CONFIGURED"
+            ? "URL_RULE_NOT_CONFIGURED means Zoho doesn't recognize this URL pattern — this is a URL-construction bug, NOT a session/auth issue. Check absoluteImageUrl in zoho-client.ts."
+            : "This is a request-construction or per-endpoint authorization failure, not a session expiry — the session file is fresh per the startup log."),
+      );
     }
     // Pull either a url hop or base64 image data.
     const urlField = env.url || env.imageUrl || env.downloadUrl || env.fileUrl || env.viewUrl || env.src;
     const dataField = env.data || env.image || env.base64 || env.imageData;
     if (urlField) {
-      const origin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+      const origin = deriveOrigin(item.url);
       const hopUrl = urlField.startsWith("http") ? urlField : `${origin}${urlField.startsWith("/") ? "" : "/"}${urlField}`;
-      const hop = await context.request.get(hopUrl);
+      // The envelope's URL is rendered inside the same Learn page — pass the
+      // ORIGINAL request URL as Referer so the hop sees the same context.
+      const hop = await authedGet(context, hopUrl, { referer: item.url });
       const hopCt = (hop.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
       const hopBuf = await hop.body();
       if (!hopCt.startsWith("image/")) {
-        throw new Error(`envelope hop ${hopUrl} returned ${hop.status()} ${hopCt} — likely expired session`);
+        throw new Error(
+          `envelope hop ${hopUrl} returned ${hop.status()} ${hopCt} — ` +
+            `body=${previewBody(hopBuf)}. The viewImage.do envelope's url field pointed at a non-image resource.`,
+        );
       }
       return { bytes: hopBuf, contentType: hopCt, endpoint: hopUrl, status: hop.status() };
     }
@@ -344,15 +468,33 @@ async function fetchOneImage(context, item) {
       const ctFromData = m ? m[1] : "image/png";
       const b64 = (m ? m[2] : dataField).replace(/\s+/g, "");
       const bytes = Buffer.from(b64, "base64");
-      if (bytes.length === 0) throw new Error("viewImage.do base64 decoded to 0 bytes");
+      if (bytes.length === 0) throw new Error("Zoho JSON envelope decoded to 0 bytes");
       return { bytes, contentType: ctFromData, endpoint: item.url, status };
     }
-    throw new Error(`viewImage.do JSON envelope had no url/base64 fields: ${buf.toString("utf8").slice(0, 200)}`);
+    throw new Error(`Zoho JSON envelope had no url/base64 fields at ${item.url}: ${previewBody(rawText)}`);
   }
   if (ct.includes("html") || ct.includes("text")) {
-    throw new Error(`Zoho returned HTML at ${item.url} — the session is expired or the URL is unreachable`);
+    // HONEST diagnosis: a FRESH session that returns HTML is almost always a
+    // request-construction fault (missing Referer, wrong URL pattern, IP/scope
+    // mismatch) — NOT session expiry. The session-freshness check at startup is
+    // the ground truth; do not mislead the operator into recapturing.
+    const body = previewBody(buf);
+    const looksLikeLogin = /<input[^>]+name=["']?LOGIN_ID/i.test(body) ||
+      /accounts\.zoho\./i.test(body) ||
+      /Sign In/i.test(body);
+    if (looksLikeLogin) {
+      throw new Error(
+        `Zoho returned a LOGIN page at ${item.url} — the saved storageState's session cookies are not authoritative ` +
+          `for this endpoint (could be cross-DC, missing scope, or actually expired). bodyPreview=${body}`,
+      );
+    }
+    throw new Error(
+      `Zoho returned HTML (not an image, not JSON) at ${item.url} — likely a request-construction fault ` +
+        `(missing Referer/Origin, wrong URL pattern, or per-endpoint authorization). The session file at ` +
+        `${STORAGE_STATE_PATH || "(none)"} is fresh per the startup log. bodyPreview=${body}`,
+    );
   }
-  throw new Error(`unexpected content-type ${ct} for ${item.url}`);
+  throw new Error(`unexpected content-type "${ct || "(none)"}" for ${item.url} — bodyPreview=${previewBody(buf)}`);
 }
 
 async function main() {
@@ -364,7 +506,15 @@ async function main() {
     failed: 0,
     failures: [],
   };
-  log("info", "kb-image-import start", { BRAIN_URL, dryRun: DRY_RUN, dataCenter: ZOHO_DATA_CENTER });
+  log("info", "kb-image-import start", {
+    BRAIN_URL,
+    dryRun: DRY_RUN,
+    dataCenter: ZOHO_DATA_CENTER,
+    storageStatePath: STORAGE_STATE_PATH || "(unset)",
+    storageStateExists: STORAGE_STATE_PATH ? fs.existsSync(STORAGE_STATE_PATH) : false,
+    politeDelayMs: POLITE_DELAY_MS,
+    importLimit: IMPORT_LIMIT || "(none)",
+  });
 
   let workList;
   try {
@@ -404,8 +554,31 @@ async function main() {
     return emitOutcome({ ...state, failed: 1, failures: [{ articleId: "_", ref: "_", reason: String(e) }] });
   }
 
+  // Warm the context with a real navigation to Zoho Learn — this attaches the
+  // session cookies to the runtime browsing context (some Zoho endpoints
+  // distinguish a navigated session from a bare APIRequestContext fetch). Best-
+  // effort; a failure here is logged but never fatal — the request-level
+  // headers below are the real fix.
+  try {
+    const warmPage = await context.newPage();
+    const origin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+    const resp = await warmPage.goto(origin, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    log("info", "warmed Zoho Learn context", {
+      origin,
+      status: resp ? resp.status() : null,
+      url: warmPage.url(),
+    });
+    await warmPage.close().catch(() => {});
+  } catch (e) {
+    log("warn", "context warm-up navigation failed (continuing)", { error: String(e) });
+  }
+
   const done = readResumeState();
   let processed = 0;
+  // Diagnostic budget — log full request URL + raw response preview for the
+  // first 8 non-image responses, then quiet down so a 1000-image run doesn't
+  // dump a megabyte of logs. The first failures are what answer "why".
+  const diagnostics = { remaining: 8 };
   // Cancel-check rate limit — read the progress page every N images, not
   // every image, so we stay polite to the dashboard endpoint.
   const CANCEL_CHECK_EVERY = 5;
@@ -430,7 +603,7 @@ async function main() {
           continue;
         }
         try {
-          const dl = await fetchOneImage(context, { articleId: a.articleId, ref: r.ref, url: r.url, slot: r.slot });
+          const dl = await fetchOneImage(context, { articleId: a.articleId, ref: r.ref, url: r.url, slot: r.slot }, diagnostics);
           await uploadImage({ articleId: a.articleId, ref: r.ref }, dl.bytes, dl.contentType);
           state.stored++;
           done.add(key);
