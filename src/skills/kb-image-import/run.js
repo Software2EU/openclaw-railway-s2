@@ -222,6 +222,16 @@ async function isCancelRequested() {
 
 async function uploadImage(item, bytes, contentType) {
   const buf = Buffer.from(bytes);
+  // Refuse to POST a zero-byte / non-image payload as a "success" — a failed
+  // fetch must NEVER look like a stored image (the dashboard's upload endpoint
+  // already rejects empty bytes, but we fail-fast here so a future endpoint
+  // relax never lets a faux-success slip through).
+  if (buf.length === 0) {
+    throw new Error(`refusing to upload 0-byte payload for ${item.articleId}::${item.ref} (skip + log instead)`);
+  }
+  if (!contentType || !contentType.startsWith("image/")) {
+    throw new Error(`refusing to upload non-image content-type "${contentType || "(none)"}" for ${item.articleId}::${item.ref}`);
+  }
   const body = JSON.stringify({
     articleId: item.articleId,
     originalRef: item.ref,
@@ -379,33 +389,74 @@ function previewBody(buf, n = 240) {
   return s.replace(/\s+/g, " ").slice(0, n);
 }
 
-async function fetchOneImage(context, item, diagnostics) {
-  // 1) Issue the request inside the authenticated context, WITH explicit
-  //    Referer + Origin headers. A bare GET drops these — Zoho's
-  //    `/scroll/viewImage.do` + `/scroll/viewFile.do` are session-authenticated
-  //    AND request-context-aware, so a missing Referer is a recurring failure
-  //    mode in addition to true session expiry.
-  let res;
+async function fetchOneImage(context, page, item, diagnostics) {
+  // GROUND-TRUTH FIX (confirmed via the previous run's `image diagnostic` logs):
+  // even WITH Referer/Origin headers attached, `context.request.get(...)`
+  // arrived effectively unauthenticated — viewFile.do returned a Zoho login
+  // page and viewImage.do returned an empty JSON envelope. A bare browser
+  // tab on the same session loads these URLs fine, so the request must be
+  // driven by the NAVIGATED page (page.goto), not a detached
+  // APIRequestContext. page.goto on an image URL triggers a real browser
+  // navigation which replays the full session (cookies + sec-fetch headers
+  // + the navigation flag Zoho's CSRF/session layer inspects).
+  //
+  // We capture the EXACT cookie header the browser sent on this request (via
+  // a page.on("request") listener) so the per-image diagnostic shows whether
+  // the session truly accompanied the call.
+  let sentCookies = null;
+  let requestUrl = item.url;
+  let requestMethod = "goto";
+  const onReq = (req) => {
+    if (sentCookies !== null) return; // capture only the first matching
+    if (req.url() === item.url) {
+      const headers = req.headers();
+      sentCookies = headers.cookie || "(no cookie header sent)";
+      requestMethod = req.method() + " (navigated)";
+    }
+  };
+  page.on("request", onReq);
+  let response;
   try {
-    res = await authedGet(context, item.url);
+    // `waitUntil: "commit"` resolves as soon as the response headers come back —
+    // we don't want to wait for full page render (Chrome wraps an image in
+    // synthetic chrome which can take time), and for a JSON/HTML body the
+    // commit point is sufficient.
+    response = await page.goto(item.url, { waitUntil: "commit", timeout: 30_000 });
   } catch (e) {
-    throw new Error(`network error fetching ${item.url}: ${String(e)}`);
+    page.off("request", onReq);
+    throw new Error(`page.goto failed for ${item.url}: ${String(e)}`);
   }
-  const status = res.status();
-  const ct = (res.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
-  const buf = await res.body();
+  page.off("request", onReq);
+  if (!response) {
+    throw new Error(`page.goto returned no response for ${item.url}`);
+  }
+  const status = response.status();
+  const ct = (response.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
+  let buf;
+  try {
+    buf = await response.body();
+  } catch (e) {
+    throw new Error(`response.body() failed for ${item.url}: ${String(e)}`);
+  }
 
-  // 2) Diagnostic: every non-image response is logged with the EXACT URL + status
-  //    + content-type + the first ~240 chars of the raw body. Capped at
-  //    DIAG_LIMIT records so a long run doesn't drown the logs, but the first
-  //    few failures are always answerable from a single grep ("image diagnostic").
+  // Diagnostic: every non-image response is logged with the EXACT URL + status
+  // + content-type + the cookies actually sent + a body preview. The FIRST
+  // non-image is dumped with NO body truncation (so the operator can see the
+  // full envelope shape — e.g. whether viewImage.do's empty JSON is truly
+  // empty or carries a real-image-url field we missed). Subsequent diagnostics
+  // truncate at 240 chars to keep the log tractable.
   const isImage = ct.startsWith("image/");
   if (!isImage && diagnostics && diagnostics.remaining > 0) {
+    const isFirst = diagnostics.remaining === diagnostics.budget;
+    const previewLen = isFirst ? 4_000 : 240;
     log("info", "image diagnostic", {
-      requestUrl: item.url,
+      method: requestMethod,
+      requestUrl,
       status,
       contentType: ct || "(none)",
-      bodyPreview: previewBody(buf),
+      bodySize: buf ? buf.length : 0,
+      bodyPreview: previewBody(buf, previewLen),
+      cookiesSent: sentCookies || "(not captured)",
       articleId: item.articleId,
       ref: item.ref,
     });
@@ -450,18 +501,21 @@ async function fetchOneImage(context, item, diagnostics) {
     if (urlField) {
       const origin = deriveOrigin(item.url);
       const hopUrl = urlField.startsWith("http") ? urlField : `${origin}${urlField.startsWith("/") ? "" : "/"}${urlField}`;
-      // The envelope's URL is rendered inside the same Learn page — pass the
-      // ORIGINAL request URL as Referer so the hop sees the same context.
-      const hop = await authedGet(context, hopUrl, { referer: item.url });
-      const hopCt = (hop.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
-      const hopBuf = await hop.body();
+      // The hop runs in the same navigated page so it carries the original
+      // viewImage.do as Referer — the right context for the second fetch.
+      const hopResp = await page.goto(hopUrl, { waitUntil: "commit", timeout: 30_000 });
+      if (!hopResp) {
+        throw new Error(`envelope hop page.goto returned no response for ${hopUrl}`);
+      }
+      const hopCt = (hopResp.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
+      const hopBuf = await hopResp.body();
       if (!hopCt.startsWith("image/")) {
         throw new Error(
-          `envelope hop ${hopUrl} returned ${hop.status()} ${hopCt} — ` +
+          `envelope hop ${hopUrl} returned ${hopResp.status()} ${hopCt} — ` +
             `body=${previewBody(hopBuf)}. The viewImage.do envelope's url field pointed at a non-image resource.`,
         );
       }
-      return { bytes: hopBuf, contentType: hopCt, endpoint: hopUrl, status: hop.status() };
+      return { bytes: hopBuf, contentType: hopCt, endpoint: hopUrl, status: hopResp.status() };
     }
     if (typeof dataField === "string" && dataField.length > 0) {
       const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(dataField);
@@ -471,27 +525,36 @@ async function fetchOneImage(context, item, diagnostics) {
       if (bytes.length === 0) throw new Error("Zoho JSON envelope decoded to 0 bytes");
       return { bytes, contentType: ctFromData, endpoint: item.url, status };
     }
-    throw new Error(`Zoho JSON envelope had no url/base64 fields at ${item.url}: ${previewBody(rawText)}`);
+    // Zoho's viewImage.do can return an EMPTY JSON envelope when the URL is
+    // malformed/missing the article scope. The first diagnostic log dumps the
+    // full body so the operator can see the actual envelope shape.
+    throw new Error(
+      `Zoho JSON envelope had no url/base64 fields at ${item.url}: ${previewBody(rawText)}. ` +
+        `An empty envelope ({} / null body) usually means the URL is missing the article-scope param Zoho requires — ` +
+        `check the dashboard's absoluteImageUrl construction.`,
+    );
   }
   if (ct.includes("html") || ct.includes("text")) {
     // HONEST diagnosis: a FRESH session that returns HTML is almost always a
-    // request-construction fault (missing Referer, wrong URL pattern, IP/scope
-    // mismatch) — NOT session expiry. The session-freshness check at startup is
-    // the ground truth; do not mislead the operator into recapturing.
+    // request-construction fault — NOT session expiry. The session-freshness
+    // log line at startup is the ground truth; do not mislead the operator
+    // into recapturing.
     const body = previewBody(buf);
     const looksLikeLogin = /<input[^>]+name=["']?LOGIN_ID/i.test(body) ||
       /accounts\.zoho\./i.test(body) ||
       /Sign In/i.test(body);
     if (looksLikeLogin) {
       throw new Error(
-        `Zoho returned a LOGIN page at ${item.url} — the saved storageState's session cookies are not authoritative ` +
-          `for this endpoint (could be cross-DC, missing scope, or actually expired). bodyPreview=${body}`,
+        `Zoho returned a LOGIN page at ${item.url} via page.goto — even a navigated request with cookies is being ` +
+          `redirected to login. Either the storageState is genuinely expired (compare the startup mtime to "now"), ` +
+          `the cookies are scoped to a different DC, or the endpoint requires a scope the user lacks. ` +
+          `bodyPreview=${body}`,
       );
     }
     throw new Error(
-      `Zoho returned HTML (not an image, not JSON) at ${item.url} — likely a request-construction fault ` +
-        `(missing Referer/Origin, wrong URL pattern, or per-endpoint authorization). The session file at ` +
-        `${STORAGE_STATE_PATH || "(none)"} is fresh per the startup log. bodyPreview=${body}`,
+      `Zoho returned HTML (not an image, not JSON) at ${item.url} — request-construction fault ` +
+        `(wrong URL pattern, missing article-scope param, or per-endpoint authorization). The session file ` +
+        `at ${STORAGE_STATE_PATH || "(none)"} is fresh per the startup log. bodyPreview=${body}`,
     );
   }
   throw new Error(`unexpected content-type "${ct || "(none)"}" for ${item.url} — bodyPreview=${previewBody(buf)}`);
@@ -554,31 +617,31 @@ async function main() {
     return emitOutcome({ ...state, failed: 1, failures: [{ articleId: "_", ref: "_", reason: String(e) }] });
   }
 
-  // Warm the context with a real navigation to Zoho Learn — this attaches the
-  // session cookies to the runtime browsing context (some Zoho endpoints
-  // distinguish a navigated session from a bare APIRequestContext fetch). Best-
-  // effort; a failure here is logged but never fatal — the request-level
-  // headers below are the real fix.
+  // Create ONE persistent page for the whole run. Every image fetch reuses it
+  // (page.goto), so each request is a real browser navigation that replays
+  // the same authenticated session — the bug the previous detached-fetch path
+  // hit. Also warm the page with a one-shot navigation to Zoho Learn to
+  // establish a navigated session before the first image fetch.
+  const page = await context.newPage();
   try {
-    const warmPage = await context.newPage();
     const origin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
-    const resp = await warmPage.goto(origin, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    const resp = await page.goto(origin, { waitUntil: "domcontentloaded", timeout: 15_000 });
     log("info", "warmed Zoho Learn context", {
       origin,
       status: resp ? resp.status() : null,
-      url: warmPage.url(),
+      url: page.url(),
     });
-    await warmPage.close().catch(() => {});
   } catch (e) {
     log("warn", "context warm-up navigation failed (continuing)", { error: String(e) });
   }
 
   const done = readResumeState();
   let processed = 0;
-  // Diagnostic budget — log full request URL + raw response preview for the
-  // first 8 non-image responses, then quiet down so a 1000-image run doesn't
-  // dump a megabyte of logs. The first failures are what answer "why".
-  const diagnostics = { remaining: 8 };
+  // Diagnostic budget — log full request URL + raw response (FULL body on the
+  // first, truncated on the next 7) for the first 8 non-image responses, then
+  // quiet down so a 1000-image run doesn't drown the logs. The first failures
+  // are what answer "why".
+  const diagnostics = { remaining: 8, budget: 8 };
   // Cancel-check rate limit — read the progress page every N images, not
   // every image, so we stay polite to the dashboard endpoint.
   const CANCEL_CHECK_EVERY = 5;
@@ -603,7 +666,7 @@ async function main() {
           continue;
         }
         try {
-          const dl = await fetchOneImage(context, { articleId: a.articleId, ref: r.ref, url: r.url, slot: r.slot }, diagnostics);
+          const dl = await fetchOneImage(context, page, { articleId: a.articleId, ref: r.ref, url: r.url, slot: r.slot }, diagnostics);
           await uploadImage({ articleId: a.articleId, ref: r.ref }, dl.bytes, dl.contentType);
           state.stored++;
           done.add(key);
@@ -627,6 +690,7 @@ async function main() {
     }
   } finally {
     writeResumeState(done);
+    await page.close().catch(() => {});
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }

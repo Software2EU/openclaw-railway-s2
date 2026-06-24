@@ -287,12 +287,25 @@ KB_SKILL_SRC=/app/src/skills/kb-image-import
 KB_SKILL_DST="$WORKSPACE_DIR/skills/kb-image-import"
 if [ -d "$KB_SKILL_SRC" ]; then
   mkdir -p "$KB_SKILL_DST"
+  # ALWAYS overwrite from the image — Railway's persistent volume keeps an old
+  # copy across redeploys; if we only seeded-when-missing, every fix would
+  # silently fail to deploy. `cp -f` is unconditional overwrite.
   cp -f "$KB_SKILL_SRC/run.js" "$KB_SKILL_DST/run.js" 2>/dev/null \
-    && echo "[kb-image-import] seeded run.js into $KB_SKILL_DST" \
+    && echo "[kb-image-import] seeded run.js into $KB_SKILL_DST (overwrite)" \
     || echo "[kb-image-import] WARN: could not seed run.js (non-fatal)" >&2
   cp -f "$KB_SKILL_SRC/SKILL.md" "$KB_SKILL_DST/SKILL.md" 2>/dev/null || true
   chmod +x "$KB_SKILL_DST/run.js" 2>/dev/null || true
   chown -R openclaw:openclaw "$KB_SKILL_DST" 2>/dev/null || true
+  # PROOF: log the deployed file's size + sha256 + mtime so the operator can
+  # confirm WHICH version is on /data after a redeploy. If a fix from main isn't
+  # taking effect, this is the one line that tells you whether the image was
+  # rebuilt (size+sha change) or whether the build cache served a stale layer.
+  if [ -f "$KB_SKILL_DST/run.js" ]; then
+    SEEDED_SHA=$(sha256sum "$KB_SKILL_DST/run.js" 2>/dev/null | awk '{print $1}' || echo "?")
+    SEEDED_SIZE=$(wc -c < "$KB_SKILL_DST/run.js" 2>/dev/null || echo "?")
+    SEEDED_MTIME=$(stat -c '%y' "$KB_SKILL_DST/run.js" 2>/dev/null || echo "?")
+    echo "[kb-image-import] deployed run.js — size=$SEEDED_SIZE bytes  sha256=$SEEDED_SHA  mtime=$SEEDED_MTIME"
+  fi
 else
   echo "[kb-image-import] WARN: $KB_SKILL_SRC missing in image — skill unavailable; rebuild from main HEAD" >&2
 fi
