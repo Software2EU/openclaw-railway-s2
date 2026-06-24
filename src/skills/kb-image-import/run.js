@@ -139,30 +139,85 @@ function writeResumeState(doneSet) {
   }
 }
 
+// Session 43 — anti-spin guard. The work-list endpoint can transiently 504
+// (Vercel 60s cap) on a cold cache, so a single failure is NOT a stop signal;
+// retry a bounded number of times with exponential backoff then ABORT the
+// skill with a NAMED error. NEVER loop forever.
+const WORKLIST_RETRIES = 3;
+const WORKLIST_BACKOFF_MS = [2_000, 5_000, 10_000];
+
+async function fetchOnce(endpoint, init) {
+  // 90s socket timeout — Vercel caps at 60s but we add slack so a slow build
+  // surfaces as a NAMED error rather than a hung fetch.
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 90_000) : null;
+  try {
+    return await fetch(endpoint, { ...init, signal: ctrl ? ctrl.signal : undefined });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function fetchWorkList() {
   if (!BRAIN_URL) throw new Error("BRAIN_URL is unset");
   if (!BEARER) throw new Error("BRAIN_BEARER_TOKEN is unset");
   const endpoint = `${BRAIN_URL}/api/wissen/zoho/image-refs?pending=true`;
-  log("info", "work-list GET", { endpoint, bearerLen: BEARER.length });
-  const res = await fetch(endpoint, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${BEARER}` },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    // A 401/403/409 here is almost always a KB_IMAGE_UPLOAD_SECRET mismatch
-    // between this OpenClaw container's env and the dashboard's env — surface
-    // it loudly so the operator can correlate it with the dashboard secret.
-    if (res.status === 401 || res.status === 403 || res.status === 409) {
-      throw new Error(
-        `work-list fetch ${res.status}: ${text.slice(0, 200)}. ` +
-          `Almost certainly KB_IMAGE_UPLOAD_SECRET differs between OpenClaw and the dashboard — ` +
-          `verify both envs hold the SAME value.`,
-      );
+  let lastErr = null;
+  for (let attempt = 0; attempt < WORKLIST_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const delay = WORKLIST_BACKOFF_MS[attempt - 1] || 10_000;
+      log("info", "work-list retry", { attempt: attempt + 1, delay });
+      await sleep(delay);
     }
-    throw new Error(`work-list fetch failed: HTTP ${res.status} — ${text.slice(0, 200)}`);
+    log("info", "work-list GET", { endpoint, attempt: attempt + 1, bearerLen: BEARER.length });
+    try {
+      const res = await fetchOnce(endpoint, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${BEARER}` },
+      });
+      if (res.ok) {
+        return res.json();
+      }
+      const text = await res.text().catch(() => "");
+      // A 401/403/409 is almost always a KB_IMAGE_UPLOAD_SECRET mismatch —
+      // FAIL FAST + LOUD, never retry (the secret won't fix itself mid-run).
+      if (res.status === 401 || res.status === 403 || res.status === 409) {
+        throw new Error(
+          `work-list ${res.status}: ${text.slice(0, 200)}. ` +
+            `Almost certainly KB_IMAGE_UPLOAD_SECRET differs between OpenClaw and the dashboard — ` +
+            `verify both envs hold the SAME value.`,
+        );
+      }
+      // 504/5xx — transient; record + retry.
+      lastErr = new Error(`work-list HTTP ${res.status} — ${text.slice(0, 200)}`);
+    } catch (e) {
+      // Catch-and-retry only NETWORK failures; the 4xx branch above rethrows.
+      if (String(e).includes("KB_IMAGE_UPLOAD_SECRET")) throw e;
+      lastErr = e;
+    }
   }
-  return res.json();
+  throw new Error(
+    `work-list fetch failed after ${WORKLIST_RETRIES} attempts — aborting. ` +
+      `Last error: ${String(lastErr).slice(0, 300)}. ` +
+      `Likely cause: dashboard is rebuilding the work-list (cold cache + 60s Vercel cap). ` +
+      `Re-trigger from Wissen-Center → Bilder importieren.`,
+  );
+}
+
+/** Read the progress page's cancel flag (best-effort; never throws). The
+ *  endpoint is the FAST `progressOnly` lane so this is cheap (~50ms). */
+async function isCancelRequested() {
+  try {
+    const res = await fetchOnce(`${BRAIN_URL}/api/wissen/zoho/image-refs?progressOnly=true`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${BEARER}` },
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    return body?.progress?.cancelRequested === true;
+  } catch {
+    return false;
+  }
 }
 
 async function uploadImage(item, bytes, contentType) {
@@ -351,11 +406,23 @@ async function main() {
 
   const done = readResumeState();
   let processed = 0;
+  // Cancel-check rate limit — read the progress page every N images, not
+  // every image, so we stay polite to the dashboard endpoint.
+  const CANCEL_CHECK_EVERY = 5;
+  let cancelled = false;
   try {
-    for (const a of workList.items) {
+    outer: for (const a of workList.items) {
       state.articles.add(a.articleId);
       for (const r of a.imageRefs) {
-        if (IMPORT_LIMIT > 0 && processed >= IMPORT_LIMIT) break;
+        if (IMPORT_LIMIT > 0 && processed >= IMPORT_LIMIT) break outer;
+        // Cancel poll between images (cheap progressOnly endpoint).
+        if (processed > 0 && processed % CANCEL_CHECK_EVERY === 0) {
+          if (await isCancelRequested()) {
+            cancelled = true;
+            log("info", "cancel requested — exiting cleanly", { stored: state.stored, processed });
+            break outer;
+          }
+        }
         state.total++;
         const key = `${a.articleId}::${r.slot}`;
         if (done.has(key)) {
@@ -384,7 +451,6 @@ async function main() {
         processed++;
         await sleep(POLITE_DELAY_MS);
       }
-      if (IMPORT_LIMIT > 0 && processed >= IMPORT_LIMIT) break;
     }
   } finally {
     writeResumeState(done);
@@ -392,7 +458,27 @@ async function main() {
     await browser.close().catch(() => {});
   }
 
+  // Stamp the run outcome on the progress page so the UI can stop polling +
+  // surface complete/cancelled/failed honestly.
+  await finalizeRun(state, cancelled).catch(() => {});
   return emitOutcome(state);
+}
+
+/** Best-effort write to the progress page on exit — sets `last_run_outcome`
+ *  to complete/cancelled/failed and refreshes the heartbeat. Uses the same
+ *  bearer secret the upload uses (no separate auth). Honest no-op on failure. */
+async function finalizeRun(state, cancelled) {
+  if (!BRAIN_URL || !BEARER) return;
+  const outcome = cancelled ? "cancelled" : state.failed === 0 ? "complete" : state.stored > 0 ? "complete_with_failures" : "failed";
+  try {
+    await fetchOnce(`${BRAIN_URL}/api/wissen/zoho/image-upload?finalize=1`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${BEARER}` },
+      body: JSON.stringify({ finalize: true, outcome, stored: state.stored, failed: state.failed }),
+    });
+  } catch (e) {
+    log("warn", "finalize call failed (continuing)", { error: String(e) });
+  }
 }
 
 main()
