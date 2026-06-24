@@ -272,41 +272,77 @@ async function ensureAuthenticatedContext(browser) {
     let stateBytes = null;
     let cookieCount = null;
     let originCount = null;
-    let zohoOriginCount = null;
+    let zohoFileCookieCount = null;
+    // Parse the storageState IN-PROCESS and pass the OBJECT to newContext().
+    // Passing a string path has been observed to silently load 0 cookies on
+    // some Playwright/Node combinations; passing the parsed object removes any
+    // path-resolution / async-read race ambiguity.
+    let parsedState = null;
     try {
       const st = fs.statSync(STORAGE_STATE_PATH);
       stateMtime = st.mtime.toISOString();
       stateBytes = st.size;
-      const parsed = JSON.parse(fs.readFileSync(STORAGE_STATE_PATH, "utf8"));
-      const cookies = Array.isArray(parsed.cookies) ? parsed.cookies : [];
+      parsedState = JSON.parse(fs.readFileSync(STORAGE_STATE_PATH, "utf8"));
+      const cookies = Array.isArray(parsedState.cookies) ? parsedState.cookies : [];
       cookieCount = cookies.length;
-      const origins = Array.isArray(parsed.origins) ? parsed.origins : [];
+      const origins = Array.isArray(parsedState.origins) ? parsedState.origins : [];
       originCount = origins.length;
-      zohoOriginCount = cookies.filter((c) =>
+      zohoFileCookieCount = cookies.filter((c) =>
         typeof c.domain === "string" && c.domain.toLowerCase().includes("zoho"),
       ).length;
     } catch (e) {
-      log("warn", "storageState read for diagnostics failed", { path: STORAGE_STATE_PATH, error: String(e) });
+      throw new Error(
+        `storageState parse FAILED at ${STORAGE_STATE_PATH}: ${String(e)}. ` +
+          `The file is either missing, unreadable, or not valid JSON — re-capture via ` +
+          `\`npx playwright codegen --save-storage=zoho-storage-state.json https://learn.zoho.${ZOHO_DATA_CENTER}\`.`,
+      );
     }
     log("info", "using storageState for Zoho session", {
       path: STORAGE_STATE_PATH,
       mtime: stateMtime,
       bytes: stateBytes,
-      cookieCount,
-      originCount,
-      zohoCookieCount: zohoOriginCount,
+      fileCookieCount: cookieCount,
+      fileOriginCount: originCount,
+      fileZohoCookieCount: zohoFileCookieCount,
     });
-    const ctx = await browser.newContext({ storageState: STORAGE_STATE_PATH });
-    // Confirm cookies actually landed in the context (the JSON had them; the
-    // context loaded them; both must be true for the session to work).
+    const ctx = await browser.newContext({ storageState: parsedState });
+    // GROUND TRUTH probe: ask the LIVE context what cookies it actually holds
+    // (not what's in the file — what made it across the JSON → context boundary).
+    // The previous diagnostic showed cookiesSent="(no cookie header sent)" on
+    // every page.goto, which means this cookie jar is empty. If it is empty,
+    // do NOT proceed — fail fast with the named cause so the operator doesn't
+    // hammer Zoho with 89 cookieless fetches.
+    let liveAll = [];
+    let liveZoho = [];
     try {
-      const liveCookies = await ctx.cookies();
-      log("info", "context cookies loaded", {
-        total: liveCookies.length,
-        zoho: liveCookies.filter((c) => (c.domain || "").toLowerCase().includes("zoho")).length,
-      });
+      liveAll = await ctx.cookies();
+      // Query the live context with the EXACT Zoho Learn origin URL — that's
+      // what the image fetches will use, and Playwright's cookie engine applies
+      // domain/path/SameSite scoping the same way.
+      liveZoho = await ctx.cookies(`https://learn.zoho.${ZOHO_DATA_CENTER}`);
     } catch (e) {
       log("warn", "context cookies probe failed", { error: String(e) });
+    }
+    log("info", "context cookies live", {
+      totalAllOrigins: liveAll.length,
+      forZohoOrigin: liveZoho.length,
+      zohoCookieNames: liveZoho.map((c) => c.name).slice(0, 10),
+    });
+    if (liveZoho.length === 0) {
+      throw new Error(
+        `storageState loaded but ZERO cookies are live for the Zoho Learn ` +
+          `origin (https://learn.zoho.${ZOHO_DATA_CENTER}). The file at ` +
+          `${STORAGE_STATE_PATH} carries ${cookieCount} total cookies / ` +
+          `${zohoFileCookieCount} on zoho domains — but none survived the ` +
+          `newContext({storageState}) load. This is a context-load fault, NOT ` +
+          `a session-expiry fault. Likely causes: (a) the cookies' Domain/Path ` +
+          `scoping excludes the Zoho Learn origin (verify Domain=.zoho.eu or ` +
+          `.learn.zoho.eu, Path=/); (b) the storageState JSON shape is malformed; ` +
+          `(c) Playwright version mismatch with the captured format. Re-capture ` +
+          `directly on the article view via ` +
+          `\`npx playwright codegen --save-storage=zoho-storage-state.json https://learn.zoho.${ZOHO_DATA_CENTER}/portal/...\` ` +
+          `(navigate the codegen browser INTO an article before saving) and try again.`,
+      );
     }
     return ctx;
   }
@@ -362,24 +398,6 @@ function deriveOrigin(absoluteUrl) {
   }
 }
 
-/** GET an authenticated-context URL with the headers a real browser sends when
- *  rendering an image inside a Zoho Learn page. The bare `context.request.get`
- *  attaches cookies but DOES NOT add Referer/Origin/X-Requested-With — Zoho's
- *  scroll endpoints can interpret a missing Referer as a cross-context fetch and
- *  refuse with HTML/JSON error. Pass these explicitly so the request matches
- *  the live browser navigation pattern. */
-async function authedGet(context, url, opts = {}) {
-  const origin = deriveOrigin(url);
-  const headers = {
-    Referer: opts.referer || `${origin}/`,
-    Origin: origin,
-    Accept: opts.accept || "image/*,application/json;q=0.9,*/*;q=0.5",
-    "X-Requested-With": "XMLHttpRequest",
-    ...(opts.headers || {}),
-  };
-  return context.request.get(url, { headers });
-}
-
 /** Truncate a Buffer/string to `n` chars of safe ASCII-ish preview so the log
  *  line stays one row (multi-MB image bytes never get dumped). */
 function previewBody(buf, n = 240) {
@@ -389,55 +407,55 @@ function previewBody(buf, n = 240) {
   return s.replace(/\s+/g, " ").slice(0, n);
 }
 
-async function fetchOneImage(context, page, item, diagnostics) {
-  // GROUND-TRUTH FIX (confirmed via the previous run's `image diagnostic` logs):
-  // even WITH Referer/Origin headers attached, `context.request.get(...)`
-  // arrived effectively unauthenticated — viewFile.do returned a Zoho login
-  // page and viewImage.do returned an empty JSON envelope. A bare browser
-  // tab on the same session loads these URLs fine, so the request must be
-  // driven by the NAVIGATED page (page.goto), not a detached
-  // APIRequestContext. page.goto on an image URL triggers a real browser
-  // navigation which replays the full session (cookies + sec-fetch headers
-  // + the navigation flag Zoho's CSRF/session layer inspects).
+async function fetchOneImage(context, item, diagnostics) {
+  // ROOT CAUSE (this iteration): the previous diagnostic showed every page.goto
+  // arriving with cookiesSent="(no cookie header sent)" — i.e. an EMPTY cookie
+  // jar on the context — AND `viewFile.do` threw "Protocol error: No resource
+  // with given identifier" because page.goto refuses to expose a download-stream
+  // body. So both prior fix paths (detached fetch in PR#13, navigated goto in
+  // PR#14) were defeated by ONE upstream fault: the context's cookie jar was
+  // empty after newContext({storageState}).
   //
-  // We capture the EXACT cookie header the browser sent on this request (via
-  // a page.on("request") listener) so the per-image diagnostic shows whether
-  // the session truly accompanied the call.
-  let sentCookies = null;
-  let requestUrl = item.url;
-  let requestMethod = "goto";
-  const onReq = (req) => {
-    if (sentCookies !== null) return; // capture only the first matching
-    if (req.url() === item.url) {
-      const headers = req.headers();
-      sentCookies = headers.cookie || "(no cookie header sent)";
-      requestMethod = req.method() + " (navigated)";
-    }
-  };
-  page.on("request", onReq);
-  let response;
+  // The startup assert above now guarantees that when fetchOneImage runs, the
+  // CONTEXT carries Zoho cookies. `context.request.get()` then carries those
+  // cookies on its requests AND reads file-download response bodies (which
+  // page.goto cannot). It's the right fetch method once cookies are real.
+  //
+  // GROUND-TRUTH PER-FETCH PROBE: before each request we ask the LIVE context
+  // what cookies it will send for THIS URL (Playwright's cookie engine applies
+  // the same Domain/Path/SameSite scoping it uses on the wire). If this is
+  // empty for an individual URL we surface it in the diagnostic — that's the
+  // true source-of-truth, NOT request.headers() which may strip cookies.
+  let cookiesForUrl = [];
   try {
-    // `waitUntil: "commit"` resolves as soon as the response headers come back —
-    // we don't want to wait for full page render (Chrome wraps an image in
-    // synthetic chrome which can take time), and for a JSON/HTML body the
-    // commit point is sufficient.
-    response = await page.goto(item.url, { waitUntil: "commit", timeout: 30_000 });
+    cookiesForUrl = await context.cookies(item.url);
+  } catch {
+    /* fall through — diagnostic only */
+  }
+  const origin = deriveOrigin(item.url);
+  let res;
+  try {
+    res = await context.request.get(item.url, {
+      headers: {
+        Referer: `${origin}/`,
+        Accept: "image/*,application/json;q=0.9,*/*;q=0.5",
+      },
+    });
   } catch (e) {
-    page.off("request", onReq);
-    throw new Error(`page.goto failed for ${item.url}: ${String(e)}`);
+    throw new Error(`context.request.get failed for ${item.url}: ${String(e)}`);
   }
-  page.off("request", onReq);
-  if (!response) {
-    throw new Error(`page.goto returned no response for ${item.url}`);
-  }
-  const status = response.status();
-  const ct = (response.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
+  const status = res.status();
+  const ct = (res.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
   let buf;
   try {
-    buf = await response.body();
+    buf = await res.body();
   } catch (e) {
     throw new Error(`response.body() failed for ${item.url}: ${String(e)}`);
   }
+  const sentCookies = cookiesForUrl.length === 0
+    ? "(no cookies live for this URL — Domain/Path scoping excludes it)"
+    : cookiesForUrl.map((c) => c.name).join(", ");
+  const requestMethod = "context.request.get";
 
   // Diagnostic: every non-image response is logged with the EXACT URL + status
   // + content-type + the cookies actually sent + a body preview. The FIRST
@@ -451,12 +469,13 @@ async function fetchOneImage(context, page, item, diagnostics) {
     const previewLen = isFirst ? 4_000 : 240;
     log("info", "image diagnostic", {
       method: requestMethod,
-      requestUrl,
+      requestUrl: item.url,
       status,
       contentType: ct || "(none)",
       bodySize: buf ? buf.length : 0,
       bodyPreview: previewBody(buf, previewLen),
-      cookiesSent: sentCookies || "(not captured)",
+      cookiesForUrl: sentCookies,
+      cookieCountForUrl: cookiesForUrl.length,
       articleId: item.articleId,
       ref: item.ref,
     });
@@ -499,13 +518,19 @@ async function fetchOneImage(context, page, item, diagnostics) {
     const urlField = env.url || env.imageUrl || env.downloadUrl || env.fileUrl || env.viewUrl || env.src;
     const dataField = env.data || env.image || env.base64 || env.imageData;
     if (urlField) {
-      const origin = deriveOrigin(item.url);
-      const hopUrl = urlField.startsWith("http") ? urlField : `${origin}${urlField.startsWith("/") ? "" : "/"}${urlField}`;
-      // The hop runs in the same navigated page so it carries the original
-      // viewImage.do as Referer — the right context for the second fetch.
-      const hopResp = await page.goto(hopUrl, { waitUntil: "commit", timeout: 30_000 });
-      if (!hopResp) {
-        throw new Error(`envelope hop page.goto returned no response for ${hopUrl}`);
+      const hopOrigin = deriveOrigin(item.url);
+      const hopUrl = urlField.startsWith("http") ? urlField : `${hopOrigin}${urlField.startsWith("/") ? "" : "/"}${urlField}`;
+      // Same fetch path as the primary — context.request.get carries the
+      // context's cookies AND reads file-download bodies that page.goto
+      // refuses ("No resource with given identifier"). Referer is the
+      // original viewImage.do URL so the hop sees the right context.
+      let hopResp;
+      try {
+        hopResp = await context.request.get(hopUrl, {
+          headers: { Referer: item.url, Accept: "image/*,*/*;q=0.5" },
+        });
+      } catch (e) {
+        throw new Error(`envelope hop context.request.get failed for ${hopUrl}: ${String(e)}`);
       }
       const hopCt = (hopResp.headers()["content-type"] || "").split(";")[0].trim().toLowerCase();
       const hopBuf = await hopResp.body();
@@ -545,9 +570,11 @@ async function fetchOneImage(context, page, item, diagnostics) {
       /Sign In/i.test(body);
     if (looksLikeLogin) {
       throw new Error(
-        `Zoho returned a LOGIN page at ${item.url} via page.goto — even a navigated request with cookies is being ` +
-          `redirected to login. Either the storageState is genuinely expired (compare the startup mtime to "now"), ` +
-          `the cookies are scoped to a different DC, or the endpoint requires a scope the user lacks. ` +
+        `Zoho returned a LOGIN page at ${item.url} via context.request.get — ` +
+          `the startup assert proved Zoho cookies are loaded in the context, so this ` +
+          `means the cookies don't survive to this specific endpoint (likely a SameSite=Strict ` +
+          `or Path=/api scoping issue — the per-fetch diagnostic shows the cookieCountForUrl). ` +
+          `The session file at ${STORAGE_STATE_PATH || "(none)"} is fresh per the startup log. ` +
           `bodyPreview=${body}`,
       );
     }
@@ -617,22 +644,29 @@ async function main() {
     return emitOutcome({ ...state, failed: 1, failures: [{ articleId: "_", ref: "_", reason: String(e) }] });
   }
 
-  // Create ONE persistent page for the whole run. Every image fetch reuses it
-  // (page.goto), so each request is a real browser navigation that replays
-  // the same authenticated session — the bug the previous detached-fetch path
-  // hit. Also warm the page with a one-shot navigation to Zoho Learn to
-  // establish a navigated session before the first image fetch.
-  const page = await context.newPage();
+  // Warm-up: an honest live probe that the session reaches Zoho. We DO NOT
+  // use the resulting page for image fetches — the per-image fetches go
+  // through `context.request.get()` which (a) carries the SAME cookies the
+  // context now holds (verified by the startup assert), (b) reads
+  // file-download response bodies that page.goto refuses with "No resource
+  // with given identifier". The warm-up page lets us log whether a navigated
+  // request makes it to /learn or gets bounced to /accounts (login).
+  let warmPage;
   try {
-    const origin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
-    const resp = await page.goto(origin, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    warmPage = await context.newPage();
+    const warmOrigin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+    const resp = await warmPage.goto(warmOrigin, { waitUntil: "domcontentloaded", timeout: 15_000 });
     log("info", "warmed Zoho Learn context", {
-      origin,
+      origin: warmOrigin,
       status: resp ? resp.status() : null,
-      url: page.url(),
+      finalUrl: warmPage.url(),
+      redirectedToLogin: warmPage.url().includes("accounts.zoho"),
     });
+    await warmPage.close().catch(() => {});
+    warmPage = null;
   } catch (e) {
     log("warn", "context warm-up navigation failed (continuing)", { error: String(e) });
+    if (warmPage) await warmPage.close().catch(() => {});
   }
 
   const done = readResumeState();
@@ -666,7 +700,7 @@ async function main() {
           continue;
         }
         try {
-          const dl = await fetchOneImage(context, page, { articleId: a.articleId, ref: r.ref, url: r.url, slot: r.slot }, diagnostics);
+          const dl = await fetchOneImage(context, { articleId: a.articleId, ref: r.ref, url: r.url, slot: r.slot }, diagnostics);
           await uploadImage({ articleId: a.articleId, ref: r.ref }, dl.bytes, dl.contentType);
           state.stored++;
           done.add(key);
@@ -690,7 +724,6 @@ async function main() {
     }
   } finally {
     writeResumeState(done);
-    await page.close().catch(() => {});
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
