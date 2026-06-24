@@ -272,42 +272,29 @@ seed_workflow_block() {
 }
 seed_workflow_block /app/src/workflows/demo-content-factory.md s2:content-factory-demo "demo workflows (5)"
 seed_workflow_block /app/src/workflows/pptx-content-factory.md s2:content-factory-pptx "pptx workflows (5)"
-seed_workflow_block /app/src/workflows/kb-image-import.md s2:kb-image-import "kb-image-import (1)"
 chown openclaw:openclaw "$WORKFLOWS_FILE" 2>/dev/null || true
 
-# --- Seed the kb-image-import skill into the workspace (durable across redeploys) ---
-# The dashboard dispatches a Node script baked into the image at
-# /app/src/skills/kb-image-import/run.js. The dispatch prompt looks first at
-# /data/workspace/skills/kb-image-import/run.js (the persistent volume copy),
-# falling back to the image copy. Seeding into the volume gives the operator a
-# stable, durable path AND survives a Railway "Redeploy" of a stale image. The
-# copy is idempotent — `cp -f` overwrites, which is harmless because the script
-# is read-only from the agent's perspective.
-KB_SKILL_SRC=/app/src/skills/kb-image-import
-KB_SKILL_DST="$WORKSPACE_DIR/skills/kb-image-import"
-if [ -d "$KB_SKILL_SRC" ]; then
-  mkdir -p "$KB_SKILL_DST"
-  # ALWAYS overwrite from the image — Railway's persistent volume keeps an old
-  # copy across redeploys; if we only seeded-when-missing, every fix would
-  # silently fail to deploy. `cp -f` is unconditional overwrite.
-  cp -f "$KB_SKILL_SRC/run.js" "$KB_SKILL_DST/run.js" 2>/dev/null \
-    && echo "[kb-image-import] seeded run.js into $KB_SKILL_DST (overwrite)" \
-    || echo "[kb-image-import] WARN: could not seed run.js (non-fatal)" >&2
-  cp -f "$KB_SKILL_SRC/SKILL.md" "$KB_SKILL_DST/SKILL.md" 2>/dev/null || true
-  chmod +x "$KB_SKILL_DST/run.js" 2>/dev/null || true
-  chown -R openclaw:openclaw "$KB_SKILL_DST" 2>/dev/null || true
-  # PROOF: log the deployed file's size + sha256 + mtime so the operator can
-  # confirm WHICH version is on /data after a redeploy. If a fix from main isn't
-  # taking effect, this is the one line that tells you whether the image was
-  # rebuilt (size+sha change) or whether the build cache served a stale layer.
-  if [ -f "$KB_SKILL_DST/run.js" ]; then
-    SEEDED_SHA=$(sha256sum "$KB_SKILL_DST/run.js" 2>/dev/null | awk '{print $1}' || echo "?")
-    SEEDED_SIZE=$(wc -c < "$KB_SKILL_DST/run.js" 2>/dev/null || echo "?")
-    SEEDED_MTIME=$(stat -c '%y' "$KB_SKILL_DST/run.js" 2>/dev/null || echo "?")
-    echo "[kb-image-import] deployed run.js — size=$SEEDED_SIZE bytes  sha256=$SEEDED_SHA  mtime=$SEEDED_MTIME"
-  fi
-else
-  echo "[kb-image-import] WARN: $KB_SKILL_SRC missing in image — skill unavailable; rebuild from main HEAD" >&2
+# --- Remove the retired kb-image-import skill from the persistent volume ---
+# The Zoho image-fetch pipeline (IP-bound + CAPTCHA-blocked) was removed when
+# the KB cut over to brain SSOT (operator edits each article directly). The
+# previous skill seeded /data/workspace/skills/kb-image-import on every boot,
+# so the stale dir survives Railway's image cache + the volume. Guarded with
+# `|| true` so a non-critical removal can never crash-loop the container under
+# `set -e` (quirk #8). Removing the marker block in WORKFLOWS.md is handled
+# idempotently by the surrounding seed_workflow_block pruning logic.
+rm -rf "$WORKSPACE_DIR/skills/kb-image-import" 2>/dev/null || true
+# Strip a stale `<!-- s2:kb-image-import -->...<!-- /s2:kb-image-import -->` block
+# from a previously-seeded WORKFLOWS.md (the seed function only prunes markers it
+# actively rewrites; without an explicit prune the retired block would sit
+# orphaned on the persistent volume forever).
+if [ -f "$WORKFLOWS_FILE" ]; then
+  awk '
+    index($0,"<!-- s2:kb-image-import -->"){skip=1}
+    skip==0{print}
+    index($0,"<!-- /s2:kb-image-import -->"){skip=0; next}
+  ' "$WORKFLOWS_FILE" > "$WORKFLOWS_FILE.tmp" 2>/dev/null \
+    && mv "$WORKFLOWS_FILE.tmp" "$WORKFLOWS_FILE" 2>/dev/null \
+    || rm -f "$WORKFLOWS_FILE.tmp" 2>/dev/null || true
 fi
 
 # Point AGENTS.md (workspace + each agent) at WORKFLOWS.md so it auto-loads.
