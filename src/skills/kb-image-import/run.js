@@ -29,12 +29,22 @@
 //   BRAIN_URL              — the dashboard origin (e.g. https://brain.software2eu.com)
 //   BRAIN_BEARER_TOKEN     — KB_IMAGE_UPLOAD_SECRET (the dashboard validates this)
 //   ZOHO_DATA_CENTER       — e.g. "eu" (default: eu)
-// One of:
-//   ZOHO_STORAGE_STATE_PATH — path to a Playwright storageState.json the operator
-//                             captured once from the browser ($STATE_DIR is the
-//                             persistent /data volume so this survives redeploys)
-//   ZOHO_EMAIL + ZOHO_PASSWORD — for headless login from credentials (may fail
-//                             behind SSO/MFA — falls back to storageState if set)
+//
+// Auth (PRIMARY — required for reliable operation):
+//   ZOHO_EMAIL + ZOHO_PASSWORD — drives a headless Playwright login from inside
+//                             the container. Zoho's /scroll/ image endpoints are
+//                             IP-bound, so an externally-captured storageState
+//                             replayed from a different IP is rejected. Logging
+//                             in from the container produces a session bound to
+//                             the SAME IP every image fetch runs from. The
+//                             operator confirmed this account is email+password
+//                             only (no MFA/SSO). The skill auto-detects ONE-step
+//                             and TWO-step Zoho login layouts.
+//
+// Auth (FALLBACK — only if the storageState was captured on the SAME IP as the
+// container; rarely true and surfaced honestly as an operator-known caveat):
+//   ZOHO_STORAGE_STATE_PATH — path to a Playwright storageState.json. Used ONLY
+//                             when ZOHO_EMAIL/ZOHO_PASSWORD are unset.
 //
 // Optional:
 //   DRY_RUN=1              — list the work and exit without uploading
@@ -261,23 +271,192 @@ async function uploadImage(item, bytes, contentType) {
   return JSON.parse(text);
 }
 
+/** Headless in-container login to Zoho. The PRIMARY auth path: Zoho's
+ *  `/scroll/` image endpoints are IP-bound (proven exhaustively in this
+ *  session — a laptop-captured storageState with 45 valid cookies is
+ *  rejected when replayed from Railway's IP and bounces to the login page),
+ *  so the session MUST originate from the SAME IP it's replayed from. By
+ *  driving the login form headless from inside the container, we get a
+ *  session bound to Railway's egress IP — the IP every subsequent image
+ *  fetch uses. The operator confirmed the account is email+password only
+ *  (no MFA/SSO). Handles both ONE-step (email+password on one screen) and
+ *  TWO-step (email → next → password) Zoho login layouts. */
+async function loginToZoho(browser) {
+  if (!ZOHO_EMAIL || !ZOHO_PASSWORD) {
+    throw new Error(
+      `ZOHO_EMAIL and ZOHO_PASSWORD env vars must be set on the OpenClaw Railway ` +
+        `service to log in from inside the container. An IP-bound Zoho session ` +
+        `captured on a different host cannot be replayed from Railway — Zoho ` +
+        `enforces IP affinity on its /scroll/ image endpoints. In-container login ` +
+        `is the only reliable path; the operator confirmed this account is ` +
+        `email+password only (no MFA/SSO).`,
+    );
+  }
+  log("info", "logging into Zoho Learn from container", { email: ZOHO_EMAIL, dataCenter: ZOHO_DATA_CENTER });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  try {
+    const learnOrigin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+    // Navigate to Learn first. If unauthed (which we always are on a fresh
+    // context), Zoho redirects to accounts.zoho.<dc>/signin?servicename=…
+    // with the SSO redirect-back wired up — completing login lands us back
+    // on Learn, ready to fetch images.
+    await page.goto(learnOrigin, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    let url = page.url();
+    log("info", "initial navigation", { url, redirectedToLogin: url.includes("accounts.zoho") });
+    if (!url.includes("accounts.zoho") && !url.includes("signin")) {
+      log("info", "no login redirect — context already authed (unexpected on a fresh context)");
+      await page.close();
+      return context;
+    }
+    // Fill EMAIL. Cover the known Zoho selectors + a generic type="email" fallback.
+    const emailSelector = 'input[name="LOGIN_ID"], input#login_id, input[type="email"]';
+    await page.waitForSelector(emailSelector, { timeout: 15_000, state: "visible" });
+    await page.fill(emailSelector, ZOHO_EMAIL);
+    log("info", "filled email");
+    // Detect ONE-step vs TWO-step layout: if the password field is already
+    // visible right after filling the email, it's one-step. Otherwise it's
+    // two-step (a Next button advances to a second screen with the password).
+    const passwordSelector = 'input[name="PASSWORD"], input#password, input[type="password"]';
+    let isOneStep = false;
+    try {
+      await page.waitForSelector(passwordSelector, { timeout: 1_500, state: "visible" });
+      isOneStep = true;
+    } catch {
+      isOneStep = false;
+    }
+    if (!isOneStep) {
+      // TWO-step: click Next and wait for the password field.
+      const nextSelector = 'button#nextbtn, button[type="submit"], input#nextbtn';
+      await page.click(nextSelector);
+      log("info", "clicked next (two-step layout)");
+      await page.waitForSelector(passwordSelector, { timeout: 15_000, state: "visible" });
+    } else {
+      log("info", "one-step layout — password field already visible");
+    }
+    // Fill PASSWORD and submit.
+    await page.fill(passwordSelector, ZOHO_PASSWORD);
+    log("info", "filled password");
+    const submitSelector = 'button#nextbtn, button[type="submit"], input#nextbtn';
+    await page.click(submitSelector);
+    log("info", "submitted login form");
+    // Wait for the SSO redirect to land back on Learn (away from accounts.zoho).
+    try {
+      await page.waitForURL((u) => !u.host.includes("accounts.zoho") && !u.toString().includes("signin"), { timeout: 30_000 });
+    } catch (e) {
+      const stuckUrl = page.url();
+      // Look for an MFA / OTP / unusual-activity challenge that would block
+      // unattended completion — surface it loudly so the operator knows.
+      const looksMfa = await page.evaluate(() => {
+        const html = document.body ? document.body.innerText || "" : "";
+        return /OTP|verification|two[-\s]?factor|2FA|authenticator|verify|unusual/i.test(html);
+      }).catch(() => false);
+      throw new Error(
+        `login did not redirect away from accounts.zoho within 30s — stuck at ${stuckUrl}. ` +
+          (looksMfa
+            ? "The login page shows an MFA / OTP / verification challenge — Playwright cannot solve it unattended. Disable MFA on this account OR use a service account without 2FA."
+            : "Likely credentials rejected (verify ZOHO_EMAIL + ZOHO_PASSWORD are correct on the OpenClaw Railway env).") +
+          ` Underlying timeout: ${String(e)}`,
+      );
+    }
+    log("info", "login completed", { finalUrl: page.url() });
+    const finalUrl = page.url();
+    if (finalUrl.includes("accounts.zoho") || finalUrl.includes("signin")) {
+      throw new Error(
+        `login appeared to complete but landed at ${finalUrl} (still on the accounts host) — ` +
+          `credentials rejected, MFA challenge, or unexpected redirect chain.`,
+      );
+    }
+    await page.close();
+    return context;
+  } catch (e) {
+    await page.close().catch(() => {});
+    await context.close().catch(() => {});
+    throw new Error(`Zoho in-container login FAILED: ${String(e)}`);
+  }
+}
+
+/** Post-login verification: navigate to Learn and assert we LAND on Learn
+ *  (not redirected to login). Also assert the context now holds cookies for
+ *  the Zoho Learn origin. If either check fails, throw — do NOT attempt
+ *  image fetches against an unauthenticated session. */
+async function verifyAuthenticatedSession(context) {
+  const learnOrigin = `https://learn.zoho.${ZOHO_DATA_CENTER}`;
+  const probePage = await context.newPage();
+  try {
+    const resp = await probePage.goto(learnOrigin, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    const finalUrl = probePage.url();
+    const redirected = finalUrl.includes("accounts.zoho") || finalUrl.includes("signin");
+    log("info", "auth verification probe", {
+      origin: learnOrigin,
+      status: resp ? resp.status() : null,
+      finalUrl,
+      redirectedToLogin: redirected,
+    });
+    if (redirected) {
+      throw new Error(
+        `auth verification FAILED — navigating to ${learnOrigin} redirected to ${finalUrl}. ` +
+          `The session is NOT authenticated; refusing to attempt image fetches against a logged-out context. ` +
+          `Verify ZOHO_EMAIL + ZOHO_PASSWORD are set correctly on the OpenClaw Railway service.`,
+      );
+    }
+    const zohoCookies = await context.cookies(learnOrigin);
+    log("info", "auth verification cookies", {
+      forZohoOrigin: zohoCookies.length,
+      zohoCookieNames: zohoCookies.map((c) => c.name).slice(0, 10),
+    });
+    if (zohoCookies.length === 0) {
+      throw new Error(
+        `auth verification: 0 cookies live for ${learnOrigin} after login — ` +
+          `the login form completed but the cookie jar is empty for the Learn origin. ` +
+          `Refusing to attempt image fetches against a cookie-less context.`,
+      );
+    }
+  } finally {
+    await probePage.close().catch(() => {});
+  }
+}
+
 async function ensureAuthenticatedContext(browser) {
-  // 1) storageState path is the operator-friendly path — capture once, reuse forever.
+  // PRIMARY PATH — in-container login from ZOHO_EMAIL + ZOHO_PASSWORD.
+  // The session originates from Railway's egress IP = same IP every image
+  // fetch runs from, so Zoho's IP-bound /scroll/ endpoints honour it. This
+  // is the only reliable path; a laptop-captured storageState is rejected
+  // cross-IP (proven in the previous run: 45 cookies, still bounced to
+  // login on the warm-up page.goto).
+  if (ZOHO_EMAIL && ZOHO_PASSWORD) {
+    const context = await loginToZoho(browser);
+    await verifyAuthenticatedSession(context);
+    // Best-effort: save the resulting state for THIS container's next run
+    // (still IP-bound, so only valid as long as Railway's egress IP doesn't
+    // rotate). A subsequent run can read it back via the fallback path
+    // below for a fast start — but in-container login stays the primary.
+    if (STORAGE_STATE_PATH) {
+      try {
+        await context.storageState({ path: STORAGE_STATE_PATH });
+        log("info", "saved post-login storageState for diagnostic re-use", { path: STORAGE_STATE_PATH });
+      } catch (e) {
+        log("warn", "could not save post-login storageState (non-fatal)", { error: String(e) });
+      }
+    }
+    return context;
+  }
+
+  // FALLBACK — operator-captured storageState. KEPT only as a manual escape
+  // hatch (e.g. diagnosing a login regression). NOT the recommended path:
+  // Zoho's /scroll/ endpoints are IP-bound, so a storageState captured on
+  // any host other than Railway's egress IP will fail with login redirects.
   if (STORAGE_STATE_PATH && fs.existsSync(STORAGE_STATE_PATH)) {
-    // PROOF: log the file's mtime + cookie count so the run-log shows whether
-    // a FRESH state file is in use. A stale capture is the single biggest
-    // recurring failure mode; this answers "is the file the operator just
-    // re-captured actually the one we're loading?" in ONE log line.
+    log("warn", "no ZOHO_EMAIL/ZOHO_PASSWORD set — falling back to storageState. " +
+      "WARNING: Zoho's /scroll/ endpoints are IP-bound; a storageState captured on " +
+      "any IP other than Railway's egress IP will be rejected with a login redirect. " +
+      "Set ZOHO_EMAIL + ZOHO_PASSWORD on the OpenClaw Railway env for the reliable " +
+      "in-container login path.");
+    let parsedState = null;
     let stateMtime = null;
     let stateBytes = null;
-    let cookieCount = null;
-    let originCount = null;
-    let zohoFileCookieCount = null;
-    // Parse the storageState IN-PROCESS and pass the OBJECT to newContext().
-    // Passing a string path has been observed to silently load 0 cookies on
-    // some Playwright/Node combinations; passing the parsed object removes any
-    // path-resolution / async-read race ambiguity.
-    let parsedState = null;
+    let cookieCount = 0;
+    let zohoFileCookieCount = 0;
     try {
       const st = fs.statSync(STORAGE_STATE_PATH);
       stateMtime = st.mtime.toISOString();
@@ -285,104 +464,36 @@ async function ensureAuthenticatedContext(browser) {
       parsedState = JSON.parse(fs.readFileSync(STORAGE_STATE_PATH, "utf8"));
       const cookies = Array.isArray(parsedState.cookies) ? parsedState.cookies : [];
       cookieCount = cookies.length;
-      const origins = Array.isArray(parsedState.origins) ? parsedState.origins : [];
-      originCount = origins.length;
       zohoFileCookieCount = cookies.filter((c) =>
         typeof c.domain === "string" && c.domain.toLowerCase().includes("zoho"),
       ).length;
     } catch (e) {
       throw new Error(
         `storageState parse FAILED at ${STORAGE_STATE_PATH}: ${String(e)}. ` +
-          `The file is either missing, unreadable, or not valid JSON — re-capture via ` +
-          `\`npx playwright codegen --save-storage=zoho-storage-state.json https://learn.zoho.${ZOHO_DATA_CENTER}\`.`,
+          `Set ZOHO_EMAIL + ZOHO_PASSWORD instead to use the in-container login path.`,
       );
     }
-    log("info", "using storageState for Zoho session", {
+    log("info", "using storageState fallback for Zoho session", {
       path: STORAGE_STATE_PATH,
       mtime: stateMtime,
       bytes: stateBytes,
       fileCookieCount: cookieCount,
-      fileOriginCount: originCount,
       fileZohoCookieCount: zohoFileCookieCount,
     });
     const ctx = await browser.newContext({ storageState: parsedState });
-    // GROUND TRUTH probe: ask the LIVE context what cookies it actually holds
-    // (not what's in the file — what made it across the JSON → context boundary).
-    // The previous diagnostic showed cookiesSent="(no cookie header sent)" on
-    // every page.goto, which means this cookie jar is empty. If it is empty,
-    // do NOT proceed — fail fast with the named cause so the operator doesn't
-    // hammer Zoho with 89 cookieless fetches.
-    let liveAll = [];
-    let liveZoho = [];
-    try {
-      liveAll = await ctx.cookies();
-      // Query the live context with the EXACT Zoho Learn origin URL — that's
-      // what the image fetches will use, and Playwright's cookie engine applies
-      // domain/path/SameSite scoping the same way.
-      liveZoho = await ctx.cookies(`https://learn.zoho.${ZOHO_DATA_CENTER}`);
-    } catch (e) {
-      log("warn", "context cookies probe failed", { error: String(e) });
-    }
-    log("info", "context cookies live", {
-      totalAllOrigins: liveAll.length,
-      forZohoOrigin: liveZoho.length,
-      zohoCookieNames: liveZoho.map((c) => c.name).slice(0, 10),
-    });
-    if (liveZoho.length === 0) {
-      throw new Error(
-        `storageState loaded but ZERO cookies are live for the Zoho Learn ` +
-          `origin (https://learn.zoho.${ZOHO_DATA_CENTER}). The file at ` +
-          `${STORAGE_STATE_PATH} carries ${cookieCount} total cookies / ` +
-          `${zohoFileCookieCount} on zoho domains — but none survived the ` +
-          `newContext({storageState}) load. This is a context-load fault, NOT ` +
-          `a session-expiry fault. Likely causes: (a) the cookies' Domain/Path ` +
-          `scoping excludes the Zoho Learn origin (verify Domain=.zoho.eu or ` +
-          `.learn.zoho.eu, Path=/); (b) the storageState JSON shape is malformed; ` +
-          `(c) Playwright version mismatch with the captured format. Re-capture ` +
-          `directly on the article view via ` +
-          `\`npx playwright codegen --save-storage=zoho-storage-state.json https://learn.zoho.${ZOHO_DATA_CENTER}/portal/...\` ` +
-          `(navigate the codegen browser INTO an article before saving) and try again.`,
-      );
-    }
+    // Verify the fallback session is actually live — same probe as the primary path.
+    await verifyAuthenticatedSession(ctx);
     return ctx;
   }
-  // 2) Headless login from creds — only works if Zoho One bypasses MFA for the user.
-  if (ZOHO_EMAIL && ZOHO_PASSWORD) {
-    log("info", "attempting headless Zoho login from credentials");
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    try {
-      await page.goto(`https://accounts.zoho.${ZOHO_DATA_CENTER}/signin`, { waitUntil: "domcontentloaded" });
-      await page.fill('input[name="LOGIN_ID"], input#login_id', ZOHO_EMAIL);
-      await page.click('button#nextbtn, button[type="submit"], input#nextbtn');
-      await page.waitForSelector('input[name="PASSWORD"], input#password', { timeout: 10_000 });
-      await page.fill('input[name="PASSWORD"], input#password', ZOHO_PASSWORD);
-      await page.click('button#nextbtn, button[type="submit"], input#nextbtn');
-      // Wait for a successful redirect away from accounts.zoho — if MFA is on,
-      // this won't complete and we surface that honestly.
-      await page.waitForURL((url) => !url.host.includes("accounts.zoho"), { timeout: 20_000 });
-      log("info", "headless Zoho login succeeded");
-      // Optionally persist the storage state for next run.
-      if (STORAGE_STATE_PATH) {
-        await context.storageState({ path: STORAGE_STATE_PATH });
-        log("info", "saved storageState for future runs", { path: STORAGE_STATE_PATH });
-      }
-      await page.close();
-      return context;
-    } catch (e) {
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
-      throw new Error(
-        `headless Zoho login failed: ${String(e)}. ` +
-          `Most likely the account requires MFA/SSO that Playwright cannot solve unattended — ` +
-          `capture a storageState.json manually (\`npx playwright codegen https://learn.zoho.${ZOHO_DATA_CENTER}\`) and ` +
-          `set ZOHO_STORAGE_STATE_PATH to its persistent path (recommended: /data/zoho-storage-state.json).`,
-      );
-    }
-  }
+
+  // Neither path configured — fail loudly with the operator runbook.
   throw new Error(
-    "No Zoho session source configured. Set either ZOHO_STORAGE_STATE_PATH (recommended) or " +
-      "ZOHO_EMAIL + ZOHO_PASSWORD (only works without MFA/SSO).",
+    "No Zoho auth source configured. Set ZOHO_EMAIL + ZOHO_PASSWORD env vars on the " +
+      "OpenClaw Railway service to log in from inside the container — Zoho's /scroll/ " +
+      "image endpoints are IP-bound, so a captured storageState replayed from a " +
+      "different IP will fail (proven in the previous session: 45 cookies, still " +
+      "redirected to login). The operator confirmed this account is email+password " +
+      "only (no MFA/SSO).",
   );
 }
 
@@ -596,10 +707,22 @@ async function main() {
     failed: 0,
     failures: [],
   };
+  // PRIMARY auth path = in-container Zoho login (ZOHO_EMAIL + ZOHO_PASSWORD).
+  // Required because Zoho's /scroll/ image endpoints are IP-bound — a session
+  // captured on any IP other than Railway's egress IP gets bounced to login.
+  // storageState is a FALLBACK only.
+  const authMode = ZOHO_EMAIL && ZOHO_PASSWORD
+    ? "in-container-login"
+    : STORAGE_STATE_PATH && fs.existsSync(STORAGE_STATE_PATH)
+      ? "storageState-fallback"
+      : "none-configured";
   log("info", "kb-image-import start", {
     BRAIN_URL,
     dryRun: DRY_RUN,
     dataCenter: ZOHO_DATA_CENTER,
+    authMode,
+    zohoEmail: ZOHO_EMAIL || "(unset)",
+    zohoPasswordSet: !!ZOHO_PASSWORD,
     storageStatePath: STORAGE_STATE_PATH || "(unset)",
     storageStateExists: STORAGE_STATE_PATH ? fs.existsSync(STORAGE_STATE_PATH) : false,
     politeDelayMs: POLITE_DELAY_MS,
