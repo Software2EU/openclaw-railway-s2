@@ -64,8 +64,12 @@ COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 #     line 95-97 copy)
 #   - playwright as a Node module at $GSTACK_DIR/node_modules/playwright
 #     (gstack's `bun install` + `bunx playwright install chromium` step below)
-# The kb-image-import skill's run.js resolves playwright from the gstack
-# install path — see resolvePlaywright() in src/skills/kb-image-import/run.js.
+# Browser skills (gstack /design-review, /benchmark, /s2-e2e-sweep) resolve
+# playwright from the gstack install path.
+# NOTE (P3B): the retired `kb-image-import` skill is GONE from this repo (no
+# `src/skills/` tree). entrypoint.sh still prunes any copy the persistent volume
+# carried from an old boot (`rm -rf $WORKSPACE_DIR/skills/kb-image-import` + the
+# `<!-- s2:kb-image-import -->` WORKFLOWS.md block) — keep that cleanup.
 
 RUN useradd -m -s /bin/bash openclaw \
     && chown -R openclaw:openclaw /app \
