@@ -154,7 +154,15 @@ const cmds={
   put_page:()=>call('put_page',{slug,content:fs.readFileSync(args[2],'utf8')}),
   search:()=>call('search',{query:slug,limit:10}),
   query:()=>call('query',{query:slug,limit:10}),
-  dream:()=>call('submit_job',{name:'autopilot-cycle',data:{},timeout_ms:1800000}),
+  // dream: pass an EXPLICIT phase list. Empty data{} falls back to the engine's
+  // ALL_PHASES, which includes `synthesize` — the phase that folds a linked
+  // company hub into a sparse contact page. That was silently re-polluting 690
+  // contact pages every M/W/F 22:00 UTC. The list below is the dashboard's
+  // canonical DREAM_PHASES (s2-brain-dashboard/src/lib/brain/dream-phases.ts) —
+  // ALL_PHASES minus `sync` (mis-imports /app into the brain) and `synthesize`
+  // (folds company text into sparse contacts). Keep these two lists in sync;
+  // if the dashboard's DREAM_PHASES changes, mirror it here in the same PR.
+  dream:()=>call('submit_job',{name:'autopilot-cycle',data:{phases:['lint','backlinks','extract','extract_facts','extract_atoms','resolve_symbol_edges','patterns','synthesize_concepts','recompute_emotional_weight','consolidate','propose_takes','grade_takes','calibration_profile','conversation_facts_backfill','embed','orphans','schema-suggest','purge']},timeout_ms:1800000}),
   doctor:()=>call('run_doctor'),
   orphans:()=>call('find_orphans'),
   backlinks:()=>call('get_backlinks',{slug}),
