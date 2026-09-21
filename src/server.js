@@ -337,6 +337,83 @@ const setupRateLimiter = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// ONE credential verifier for every authenticated surface (/setup, /tui/ws and
+// the gateway proxy). Previously /setup and the TUI each carried their own copy
+// of the Basic check and the proxy had NONE: every unmatched request was
+// forwarded to the gateway with the gateway token injected, so the public
+// internet could call /v1/* and read the token off the /openclaw redirect.
+//
+// Accepted credentials:
+//   - `Authorization: Bearer <ACP_TOKEN>` — the S2 dashboard (machine caller).
+//     Only valid on the proxy; /setup and the TUI stay Basic-only.
+//   - `Authorization: Basic <any-user>:<SETUP_PASSWORD>` — the operator's
+//     browser (setup wizard, TUI, Control UI).
+// Both comparisons hash each side first so timingSafeEqual sees equal lengths
+// and the compare time does not depend on the secret.
+// FAIL CLOSED: an unset ACP_TOKEN disables the Bearer path entirely; an unset
+// SETUP_PASSWORD disables the Basic path. Neither ever degrades to "allow".
+// ---------------------------------------------------------------------------
+const ACP_TOKEN = process.env.ACP_TOKEN?.trim() || "";
+
+function secretEquals(given, expected) {
+  if (!expected) return false;
+  const a = crypto.createHash("sha256").update(String(given ?? "")).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function parseAuthorization(req) {
+  const header = req.headers.authorization || "";
+  const sp = header.indexOf(" ");
+  if (sp <= 0) return { scheme: "", credential: "" };
+  return {
+    scheme: header.slice(0, sp).toLowerCase(),
+    credential: header.slice(sp + 1).trim(),
+  };
+}
+
+/**
+ * Returns { ok: true, via: "bearer" | "basic" } or { ok: false, reason }.
+ * `allowBearer` is false for /setup and the TUI (operator-only surfaces).
+ * `reason` is a short code for logs — it never contains a credential.
+ */
+function verifyCredentials(req, { allowBearer }) {
+  const { scheme, credential } = parseAuthorization(req);
+  if (!scheme) return { ok: false, reason: "no-credentials" };
+
+  if (scheme === "bearer") {
+    if (!allowBearer) return { ok: false, reason: "bearer-not-accepted-here" };
+    if (!ACP_TOKEN) return { ok: false, reason: "acp-token-unset" };
+    return secretEquals(credential, ACP_TOKEN)
+      ? { ok: true, via: "bearer" }
+      : { ok: false, reason: "bad-bearer" };
+  }
+
+  if (scheme === "basic") {
+    if (!SETUP_PASSWORD) return { ok: false, reason: "setup-password-unset" };
+    if (!credential) return { ok: false, reason: "no-credentials" };
+    const decoded = Buffer.from(credential, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+    return secretEquals(password, SETUP_PASSWORD)
+      ? { ok: true, via: "basic" }
+      : { ok: false, reason: "bad-basic" };
+  }
+
+  return { ok: false, reason: "unsupported-scheme" };
+}
+
+function clientIp(req) {
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+// One line per refused request — method, path (no query string: a query may
+// carry a token), ip, reason. Never a credential.
+function logRefusal(method, pathname, ip, reason) {
+  log.warn("auth", `refused ${method} ${pathname} ip=${ip} reason=${reason}`);
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -347,33 +424,43 @@ function requireSetupAuth(req, res, next) {
       );
   }
 
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  const ip = clientIp(req);
   if (setupRateLimiter.isRateLimited(ip)) {
     return res.status(429).type("text/plain").send("Too many requests. Try again later.");
   }
 
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
+  const verdict = verifyCredentials(req, { allowBearer: false });
+  if (!verdict.ok) {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
-  if (!isValid) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
+    return res
+      .status(401)
+      .send(verdict.reason === "bad-basic" ? "Invalid password" : "Auth required");
   }
   return next();
 }
 
+/**
+ * Gate for everything that is proxied to the OpenClaw gateway (HTTP catch-all
+ * and non-TUI WebSocket upgrades). Only failures count against the rate
+ * limiter, so a flood of bad attempts can never lock out a correctly
+ * authenticated caller (Railway's edge makes many clients share one req.ip).
+ */
+function checkProxyAuth(req, method, pathname) {
+  const verdict = verifyCredentials(req, { allowBearer: true });
+  if (verdict.ok) return verdict;
+  const ip = clientIp(req);
+  logRefusal(method, pathname, ip, verdict.reason);
+  const limited = setupRateLimiter.isRateLimited(ip);
+  return { ok: false, reason: verdict.reason, status: limited ? 429 : 401 };
+}
+
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
+// JSON body parsing ONLY for the wizard's own API (the four routes that read
+// req.body are all /setup/api/*). Mounted globally it consumed the request
+// stream of every proxied POST before proxy.web could pipe it, so e.g. a JSON
+// POST /v1/chat/completions reached the gateway with an empty body.
+app.use("/setup/api", express.json({ limit: "1mb" }));
 
 app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
@@ -1006,16 +1093,7 @@ app.get("/tui", requireSetupAuth, (_req, res) => {
 let activeTuiSession = null;
 
 function verifyTuiAuth(req) {
-  if (!SETUP_PASSWORD) return false;
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) return false;
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  return crypto.timingSafeEqual(passwordHash, expectedHash);
+  return verifyCredentials(req, { allowBearer: false }).ok;
 }
 
 function createTuiWebSocketServer(httpServer) {
@@ -1161,6 +1239,13 @@ const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : GATEWAY_TARGET;
 
+// Gateway-token injection. It REPLACES the caller's Authorization header (the
+// ACP bearer or the operator's Basic credential) with the gateway token, so the
+// gateway token never leaves the container. These handlers only run for
+// requests that already passed checkProxyAuth — the catch-all and the upgrade
+// handler below refuse everything else before calling proxy.web / proxy.ws.
+// /hooks/ is gated like every other path; it keeps its pre-existing exception
+// to the injection only (the caller's header is forwarded unchanged).
 proxy.on("proxyReq", (proxyReq, req, res) => {
   if (!req.url?.startsWith("/hooks/")) {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
@@ -1174,6 +1259,19 @@ proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
 });
 
 app.use(async (req, res) => {
+  // Everything that reaches the catch-all is on its way to the gateway (or to
+  // the /setup redirect). Authenticate FIRST; public routes (/healthz,
+  // /setup/healthz, /skills, /styles.css) are registered above and never get
+  // here. /hooks/ gets no exception.
+  const auth = checkProxyAuth(req, req.method, req.path);
+  if (!auth.ok) {
+    if (auth.status === 429) {
+      return res.status(429).type("text/plain").send("Too many requests. Try again later.");
+    }
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw"');
+    return res.status(401).type("text/plain").send("Auth required");
+  }
+
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
   }
@@ -1196,7 +1294,12 @@ app.use(async (req, res) => {
     }
   }
 
-  if (req.path === "/openclaw" && !req.query.token) {
+  // The Control UI reads the gateway token from ?token=. This redirect used to
+  // run for ANY caller, which handed the gateway token to the public internet.
+  // It now runs only for the operator's browser, i.e. a request that already
+  // passed the gate with Basic SETUP_PASSWORD — a person who can already open
+  // /setup. A Bearer (dashboard) caller never receives the token.
+  if (req.path === "/openclaw" && !req.query.token && auth.via === "basic") {
     return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
   }
 
@@ -1208,6 +1311,12 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
   log.info("wrapper", `web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
   log.info("wrapper", `configured: ${isConfigured()}`);
+  if (!ACP_TOKEN) {
+    log.warn("auth", "ACP_TOKEN is not set — the dashboard (Bearer) cannot reach the gateway; only Basic SETUP_PASSWORD is accepted");
+  }
+  if (!SETUP_PASSWORD) {
+    log.warn("auth", "SETUP_PASSWORD is not set — no browser access to /setup or the Control UI");
+  }
 
   if (isConfigured()) {
     (async () => {
@@ -1253,6 +1362,19 @@ server.on("upgrade", async (req, socket, head) => {
     tuiWss.handleUpgrade(req, socket, head, (ws) => {
       tuiWss.emit("connection", ws, req);
     });
+    return;
+  }
+
+  // Every non-TUI upgrade is proxied to the gateway with the gateway token
+  // injected (proxyReqWs), so it passes the same gate as HTTP.
+  const auth = checkProxyAuth(req, "WS", url.pathname);
+  if (!auth.ok) {
+    socket.write(
+      auth.status === 429
+        ? "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n"
+        : "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"OpenClaw\"\r\nConnection: close\r\n\r\n",
+    );
+    socket.destroy();
     return;
   }
 

@@ -37,7 +37,19 @@ This template exposes your OpenClaw gateway to the public internet.
 
 ### Required
 
-- `SETUP_PASSWORD`: password for `/setup`
+- `SETUP_PASSWORD`: password for `/setup`, the TUI and the Control UI (Basic auth)
+- `ACP_TOKEN`: the bearer the S2 dashboard sends (`Authorization: Bearer <ACP_TOKEN>`).
+  Every request that is proxied to the gateway (HTTP and WebSocket, including
+  `/v1/*`, `/openclaw` and `/hooks/*`) must carry this bearer or Basic
+  `SETUP_PASSWORD`; anything else gets 401. Unset = the Bearer path is closed.
+- `GBRAIN_CLIENT_ID` / `GBRAIN_CLIENT_SECRET`: read-only gbrain-mcp OAuth client
+  for the `gbrain` CLI. The entrypoint writes them to `/etc/s2/gbrain-read.json`.
+
+### Must NOT be set
+
+- `DATABASE_URL`, `GBRAIN_DATABASE_URL`: the entrypoint refuses to boot if either
+  is non-empty. Brain writes go through the dashboard bridge only.
+- `GBRAIN_API_KEY`: obsolete and unused (logged as a warning if present).
 
 ### Recommended
 
@@ -53,6 +65,7 @@ This template exposes your OpenClaw gateway to the public internet.
 - `ENABLE_WEB_TUI=false`
 - `TUI_IDLE_TIMEOUT_MS=300000`
 - `TUI_MAX_SESSION_MS=1800000`
+- `GBRAIN_MCP_PORT=8080` (gbrain-mcp's internal port; written into `/etc/s2/gbrain-read.json`)
 
 ## Day-1 Setup Checklist
 
@@ -134,27 +147,40 @@ docker run --rm -p 8080:8080 \
 ## Useful Endpoints
 
 - `/setup` - onboarding + management
-- `/openclaw` - Control UI
-- `/healthz` - public health
+- `/openclaw` - Control UI (Basic `SETUP_PASSWORD`)
+- `/healthz`, `/setup/healthz`, `/skills` - public health / status (no auth)
 - `/logs` - live server logs UI
+
+## Brain access from this container (S2)
+
+The `gbrain` command in this container (`src/gbrain-shim.mjs`, installed to
+`/usr/local/bin/gbrain`) is **read-only against the engine** and routes every
+write through the S2 dashboard's bridge:
+
+- Reads (`get_page`, `search`, `query`, `backlinks`, `links`, `timeline`,
+  `list`, `versions`, `stats`, `health`, `list-tools`) call gbrain-mcp on
+  `gbrain-mcp.railway.internal:8080` with a read-only OAuth client credential.
+- Writes (`put_page`, `phase-result`, `put-raw`, `get-raw`) call the dashboard
+  bridge with `--bridge <url> --grant <token>` (or `S2_BRIDGE`/`S2_GRANT`), both
+  supplied by the dispatch prompt.
+- `dream`, `delete`, `add-timeline`, `doctor`, `orphans`, `think`, `jobs` are
+  REMOVED and exit 1 with "not available".
 
 ## Scheduled jobs (S2 Brain context)
 
-This OpenClaw service is the **scheduler** for the S2 Brain dream/autopilot
-cycle. The cron `gbrain dream M/W/F 22:00 UTC` runs inside this container; the
-CLI compiles to `submit_job {name: "autopilot-cycle"}` against the gbrain-mcp
-service over MCP — it ENQUEUES the job, it does NOT execute it.
+This container previously scheduled the dream/autopilot cycle with a cron
+running `gbrain dream` M/W/F 22:00 UTC (it enqueued `submit_job
+{name: "autopilot-cycle"}` on gbrain-mcp). **`gbrain dream` no longer exists
+here** — enqueueing a job is an admin op and this container now holds only a
+read-only credential. If that cron is still configured in the OpenClaw volume it
+will fail with "not available"; the cycle must be enqueued from the dashboard
+(`triggerDreamCycle`, `s2-brain-dashboard/src/lib/brain/dream-cycle.ts`), which
+owns the canonical `DREAM_PHASES`.
 
 Execution happens in the **gbrain-mcp** container (`gbrain jobs work`, started
 by that image's `entrypoint.sh`). OpenClaw runs zero minion-job consumers; do
 not add a `gbrain jobs work` to this container — that would race the gbrain-mcp
 worker for the same row.
-
-The June 2026 dream-cycle outage was NOT in this repo (the cron fired
-correctly every M/W/F for 15 days). The outage was that gbrain-mcp's worker
-wasn't running because a Railway custom Start Command override silently
-disabled the `gbrain jobs work` half of its CMD. That's been fixed by baking
-the worker into the gbrain-mcp entrypoint. See the gbrain-mcp README.
 
 ## Support
 
