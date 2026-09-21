@@ -1,7 +1,13 @@
-# Keep shell scripts LF-only so the Linux shebang survives a Windows checkout.
-# Without this, Git for Windows (core.autocrlf=true by default) rewrites LF->CRLF
-# on checkout, and the container fails to start with:
-#   exec .../entrypoint.sh: No such file or directory
-# (the kernel can't find interpreter "/bin/bash\r").
-*.sh text eol=lf
-entrypoint.sh text eol=lf
+# Everything in this repo runs in a Linux container, so check EVERYTHING out
+# with LF — not just shell scripts. Git for Windows (core.autocrlf=true) rewrites
+# LF->CRLF on checkout, and `railway up` uploads the working tree as-is:
+#   - entrypoint.sh: exec .../entrypoint.sh: No such file or directory ("/bin/bash\r")
+#   - src/gbrain-shim.mjs (2026-09-21): /usr/bin/env: 'node\r': No such file or directory
+# The second one broke every `gbrain` command in the container on its first deploy.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
