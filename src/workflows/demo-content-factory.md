@@ -33,6 +33,22 @@ registrations survive Railway redeploys (in-memory chat registration does not).
   # every write: ... --bridge "$S2_BRIDGE" --grant "$S2_GRANT"
   ```
 
+- **Report progress — the operator is watching.** At the START of every numbered
+  step, send one short German line saying what you are doing now. It appears on
+  the project page ("Läuft seit 1:12 · Zuletzt: Aufnahme läuft"); without it the
+  page shows only a spinner and the operator cannot tell a working run from a
+  dead one. It is best-effort (never fails the run), so never skip a real step
+  because of it:
+
+  ```sh
+  gbrain progress "${project_slug}" "Browser startet" --bridge "$S2_BRIDGE" --grant "$S2_GRANT"
+  gbrain progress "${project_slug}" "Aufnahme läuft (Szene 1/3)" --bridge "$S2_BRIDGE" --grant "$S2_GRANT"
+  gbrain progress "${project_slug}" "Dateien werden hochgeladen" --bridge "$S2_BRIDGE" --grant "$S2_GRANT"
+  ```
+
+- **Report the section body WITHOUT its own heading.** The dashboard writes the
+  `## <phase>` heading itself; a body that repeats it is stripped, not doubled.
+
 - Write commands: `gbrain put-raw <file>` (upload a file; prints ONLY the stored
   path), `gbrain get-raw <path> <outfile>` (download a file an earlier phase of
   THIS project stored), `gbrain phase-result <slug> <file> --set <key>=<value>`
