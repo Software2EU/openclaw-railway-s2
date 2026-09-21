@@ -383,6 +383,27 @@ async function putPage(p, flags) {
   console.log(JSON.stringify(r.json));
 }
 
+// One status line for the operator watching the project page ("Aufnahme
+// läuft"). BEST-EFFORT by design: a refused or failed status line prints a
+// warning and exits 0 — losing a status line must never stop a run that is
+// otherwise working. Usage errors (no slug/message/grant) still fail loudly.
+async function progress(p, flags) {
+  const usage = 'gbrain progress <slug> "<one line: what you are doing now>" --bridge <url> --grant <token>';
+  const slug = need(p[0], "<slug>", usage);
+  const message = need(p.slice(1).join(" ").trim(), "<message>", usage);
+  const ctx = bridgeContext(flags);
+  try {
+    const r = await bridgeCall(ctx, "/progress", { slug, message });
+    if (!r.ok) {
+      console.error(`gbrain: progress not recorded (${r.status}): ${JSON.stringify(r.json ?? {})} — continuing`);
+      return;
+    }
+    console.log(JSON.stringify(r.json));
+  } catch (e) {
+    console.error(`gbrain: progress not recorded (${e && e.message ? e.message : e}) — continuing`);
+  }
+}
+
 async function phaseResult(p, flags) {
   const usage =
     'gbrain phase-result <slug> <file> [--set key=value]... | gbrain phase-result <slug> --failed "<reason>"  (+ --bridge <url> --grant <token>)';
@@ -456,6 +477,7 @@ async function getRaw(p, flags) {
 
 const WRITES = {
   put_page: putPage,
+  progress,
   "phase-result": phaseResult,
   "put-raw": putRaw,
   "get-raw": getRaw,
@@ -475,6 +497,7 @@ function usage() {
     "",
     "writes (dashboard bridge; need --bridge <url> --grant <token> or S2_BRIDGE/S2_GRANT):",
     "  put_page <slug> <file>",
+    "  progress <slug> \"<what you are doing now>\"         (best-effort status line; never fails the run)",
     "  phase-result <slug> <file> [--set key=value]...   |   phase-result <slug> --failed \"<reason>\"",
     "  put-raw <localfile> [--name <filename>]            (prints the stored path only)",
     "  get-raw <path> <outfile>",
