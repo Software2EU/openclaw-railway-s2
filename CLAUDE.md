@@ -50,11 +50,12 @@ open http://localhost:8080/setup  # password: test
 
 1. **User → Railway → Wrapper (Express on PORT)** → routes to:
    - `/setup/*` → setup wizard (auth: Basic with `SETUP_PASSWORD`)
-   - All other routes → proxied to internal gateway
+   - `/healthz`, `/setup/healthz`, `/skills`, `/styles.css` → public
+   - All other routes → **gated** (`Bearer <ACP_TOKEN>` or Basic `SETUP_PASSWORD`, else 401) → proxied to internal gateway
 
 2. **Wrapper → Gateway** (localhost:18789 by default)
    - HTTP/WebSocket reverse proxy via `http-proxy`
-   - Automatically injects `Authorization: Bearer <token>` header
+   - After the gate passes, REPLACES the caller's `Authorization` with `Bearer <gateway token>` (the gateway token never leaves the container)
 
 ### Lifecycle States
 
@@ -79,7 +80,11 @@ open http://localhost:8080/setup  # password: test
 ### Environment Variables
 
 **Required:**
-- `SETUP_PASSWORD` — protects `/setup` wizard
+- `SETUP_PASSWORD` — protects `/setup`, the TUI and (Basic) the proxied Control UI
+- `ACP_TOKEN` — the S2 dashboard's bearer for the proxied gateway (`/v1/*`, WS, `/hooks/*`). Unset = Bearer path closed (fail closed)
+- `GBRAIN_CLIENT_ID` / `GBRAIN_CLIENT_SECRET` — read-only gbrain-mcp OAuth client for the `gbrain` CLI (entrypoint writes `/etc/s2/gbrain-read.json`)
+
+**Must NOT be set:** `DATABASE_URL`, `GBRAIN_DATABASE_URL` (entrypoint refuses to boot). `GBRAIN_API_KEY` is obsolete and unused.
 
 **Recommended (Railway template defaults):**
 - `OPENCLAW_STATE_DIR=/data/.openclaw` — config + credentials
@@ -95,7 +100,7 @@ open http://localhost:8080/setup  # password: test
 
 The wrapper manages a **two-layer auth scheme**:
 
-1. **Setup wizard auth**: Basic auth with `SETUP_PASSWORD` (src/server.js:190)
+1. **Wrapper auth** (one verifier, `verifyCredentials` in src/server.js): Basic `SETUP_PASSWORD` for `/setup` + TUI; for everything proxied to the gateway (`checkProxyAuth`, HTTP catch-all AND WebSocket upgrade) Basic `SETUP_PASSWORD` OR `Bearer <ACP_TOKEN>`. Refusals are logged one line each (method, path, ip, reason) and count against `setupRateLimiter`.
 2. **Gateway auth**: Bearer token (auto-generated or from `OPENCLAW_GATEWAY_TOKEN` env)
    - Token is auto-injected into proxied requests (src/server.js:736, src/server.js:741)
    - Persisted to `${STATE_DIR}/gateway.token` if not provided via env (src/server.js:25-48)
@@ -114,14 +119,14 @@ When the user runs setup (src/server.js:522-693):
 
 ### Gateway Token Injection
 
-The wrapper **always** injects the bearer token into proxied requests so browser clients don't need to know it:
+The wrapper injects the gateway bearer token into proxied requests that **already passed the gate** (it replaces the caller's ACP bearer / Basic header):
 
 - HTTP requests: via `proxy.on("proxyReq")` event handler (src/server.js:736)
 - WebSocket upgrades: via `proxy.on("proxyReqWs")` event handler (src/server.js:741)
 
 **Important**: Token injection uses `http-proxy` event handlers (`proxyReq` and `proxyReqWs`) rather than direct `req.headers` modification. Direct header modification does not reliably work with WebSocket upgrades, causing intermittent `token_missing` or `token_mismatch` errors.
 
-This allows the Control UI at `/openclaw` to work without user authentication.
+The Control UI at `/openclaw` requires Basic `SETUP_PASSWORD`; only such a request gets the `/openclaw?token=` redirect. **Never add an unauthenticated path to the gateway** — before this gate, unauthenticated `GET /v1/models` returned 200 from the public internet and `/openclaw` redirected anyone to `?token=<gateway token>`. `node scripts/check-server-gate.mjs` asserts the gate against the real server.js.
 
 ## Common Development Tasks
 
@@ -196,3 +201,4 @@ This avoids repeatedly reading large files and provides instant context about th
 6. **WebSocket auth requires proxy event handlers** → Direct `req.headers` modification doesn't work for WebSocket upgrades with http-proxy; must use `proxyReqWs` event (src/server.js:741) to reliably inject Authorization header
 7. **Control UI requires allowInsecureAuth to bypass pairing** → Set `gateway.controlUi.allowInsecureAuth=true` during onboarding to prevent "disconnected (1008): pairing required" errors (GitHub issue #2284). Wrapper already handles bearer token auth, so device pairing is unnecessary.
 8. **`entrypoint.sh` runs under `set -e` on a PERSISTENT volume — every one-shot config write MUST be idempotent + non-fatal** → June 2026 crash-loop incident: the git-auth step set the MULTI-VALUED key `url.https://github.com/.insteadOf` with a plain `git config <key> <value>`. The `--add` line appends a second rewrite (git@ + ssh://) and the openclaw user's `~/.gitconfig` persists across restarts, so from the 2nd boot the plain set hit a key with >1 value → `error: cannot overwrite multiple values with a single value` → non-zero exit → `set -e` aborts boot → container crash-loop (each loop also rewrote `openclaw.json` + rotated the gateway token). Fix: `--unset-all` then `--add` the two rewrites, each guarded with `|| true`/`|| echo`. Rule going forward: any `git config`/one-shot setup in the entrypoint must be multi-value-safe (`--unset-all`/`--replace-all`) AND `|| true`-guarded so a non-critical step can never crash-loop the container.
+9. **Brain access is read-only from this container; writes go through the dashboard bridge** → `src/gbrain-shim.mjs` (installed as `/usr/local/bin/gbrain`) reads gbrain-mcp on port 8080 with a read-only OAuth client and sends `put_page` / `phase-result` / `put-raw` / `get-raw` to the dashboard bridge (`--bridge`/`--grant` from the dispatch prompt). Never bake a credential into the shim, never re-add engine write/admin ops, never give this service a database URL (the entrypoint refuses to boot with `DATABASE_URL`/`GBRAIN_DATABASE_URL`).

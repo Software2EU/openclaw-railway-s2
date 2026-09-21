@@ -1,6 +1,28 @@
 #!/bin/bash
 set -e
 
+# --- Precondition: this container must NEVER hold the brain's database URL ---
+# All brain writes go through the S2 dashboard's write pipeline (the "bridge");
+# reads go to gbrain-mcp with a read-only OAuth client. A Postgres URL here
+# would let the real gbrain CLI at /opt/gbrain (or any agent shell — acpx runs
+# approve-all) write the brain directly, bypassing both. FAIL LOUD, same
+# discipline as the /opt/gbrain seam precondition below. Only the variable
+# NAMES are printed, never their values.
+db_vars=""
+[ -n "${DATABASE_URL:-}" ] && db_vars="$db_vars DATABASE_URL"
+[ -n "${GBRAIN_DATABASE_URL:-}" ] && db_vars="$db_vars GBRAIN_DATABASE_URL"
+if [ -n "$db_vars" ]; then
+  echo "========================================================================" >&2
+  echo "[entrypoint] FATAL: set on this service:$db_vars" >&2
+  echo "[entrypoint] This container must never hold the brain's database URL. All" >&2
+  echo "[entrypoint] brain writes go through the dashboard bridge; reads use the" >&2
+  echo "[entrypoint] read-only GBRAIN_CLIENT_ID/GBRAIN_CLIENT_SECRET. Remove the" >&2
+  echo "[entrypoint] variable(s) from the Railway service and redeploy." >&2
+  echo "========================================================================" >&2
+  exit 1
+fi
+unset db_vars
+
 STATE_DIR=/data/.openclaw
 
 chown -R openclaw:openclaw /data
@@ -142,47 +164,45 @@ chown -R openclaw:openclaw /home/openclaw/.acpx 2>/dev/null || true
 # Re-normalize ownership: sed above ran as root and may have re-owned files
 chown -R openclaw:openclaw /data
 
-# Install gbrain CLI shim (calls GBrain MCP via HTTP)
-# GBRAIN_API_KEY must be set as a Railway environment variable on this service
-cat > /usr/local/bin/gbrain << GBRAIN_SHIM
-#!/usr/bin/env node
-const http=require('http'),fs=require('fs'),args=process.argv.slice(2),cmd=args[0],slug=args[1];
-const opts={hostname:'gbrain-mcp.railway.internal',port:3131,path:'/mcp',method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream','Authorization':'Bearer ${GBRAIN_API_KEY}'}};
-const call=(name,a={})=>JSON.stringify({jsonrpc:'2.0',method:'tools/call',params:{name,arguments:a},id:1});
-const cmds={
-  get_page:()=>call('get_page',{slug}),
-  put_page:()=>call('put_page',{slug,content:fs.readFileSync(args[2],'utf8')}),
-  search:()=>call('search',{query:slug,limit:10}),
-  query:()=>call('query',{query:slug,limit:10}),
-  // dream: pass an EXPLICIT phase list. Empty data{} falls back to the engine's
-  // ALL_PHASES, which includes `synthesize` — the phase that folds a linked
-  // company hub into a sparse contact page. That was silently re-polluting 690
-  // contact pages every M/W/F 22:00 UTC. The list below is the dashboard's
-  // canonical DREAM_PHASES (s2-brain-dashboard/src/lib/brain/dream-phases.ts) —
-  // ALL_PHASES minus `sync` (mis-imports /app into the brain) and `synthesize`
-  // (folds company text into sparse contacts). Keep these two lists in sync;
-  // if the dashboard's DREAM_PHASES changes, mirror it here in the same PR.
-  dream:()=>call('submit_job',{name:'autopilot-cycle',data:{phases:['lint','backlinks','extract','extract_facts','extract_atoms','resolve_symbol_edges','patterns','synthesize_concepts','recompute_emotional_weight','consolidate','propose_takes','grade_takes','calibration_profile','conversation_facts_backfill','embed','orphans','schema-suggest','purge']},timeout_ms:1800000}),
-  doctor:()=>call('run_doctor'),
-  orphans:()=>call('find_orphans'),
-  backlinks:()=>call('get_backlinks',{slug}),
-  health:()=>call('get_health'),
-  stats:()=>call('get_stats'),
-  links:()=>call('get_links',{slug}),
-  timeline:()=>call('get_timeline',{slug}),
-  'add-timeline':()=>call('add_timeline_entry',{slug,date:args[2],summary:args[3]}),
-  think:()=>call('think',{question:slug}),
-  'list-tools':()=>JSON.stringify({jsonrpc:'2.0',method:'tools/list',params:{},id:1}),
-  delete:()=>call('delete_page',{slug}),
-  list:()=>call('list_pages',{type:slug,limit:50}),
-  versions:()=>call('get_versions',{slug}),
-  jobs:()=>call('list_jobs',{limit:20}),
-};
-if(!cmds[cmd]){console.log('Commands: '+Object.keys(cmds).join(', '));process.exit(1);}
-const req=http.request(opts,r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>console.log(d));});
-req.write(cmds[cmd]());req.end();
-GBRAIN_SHIM
-chmod +x /usr/local/bin/gbrain
+# --- gbrain CLI: reads -> engine (read-only OAuth), writes -> dashboard bridge -
+# The shim is a real file (src/gbrain-shim.mjs) — no secret is baked into it.
+# The previous heredoc shim interpolated a FULL-ACCESS GBRAIN_API_KEY into
+# /usr/local/bin/gbrain, pointed at port 3131 (gbrain-mcp listens on 8080), and
+# exposed write/admin ops (put_page, delete, add-timeline, dream, doctor, ...)
+# straight against the engine. All of that is gone: see the header of
+# src/gbrain-shim.mjs for the command set.
+if [ -n "${GBRAIN_API_KEY:-}" ]; then
+  echo "[gbrain] WARN: GBRAIN_API_KEY is set but OBSOLETE and UNUSED — remove it from the Railway service (reads use GBRAIN_CLIENT_ID/GBRAIN_CLIENT_SECRET, writes use the dashboard bridge)" >&2
+fi
+install -m 755 /app/src/gbrain-shim.mjs /usr/local/bin/gbrain
+
+# Read-only engine credential for the shim. The agent's exec environment is not
+# guaranteed to inherit Railway variables, so the entrypoint (root) writes them
+# to a file only root and the openclaw group can read. Values are passed to node
+# through the environment, never interpolated into a script.
+GBRAIN_READ_CFG=/etc/s2/gbrain-read.json
+install -d -m 0750 -o root -g openclaw /etc/s2
+if [ -n "${GBRAIN_CLIENT_ID:-}" ] && [ -n "${GBRAIN_CLIENT_SECRET:-}" ]; then
+  ( umask 077 && node -e '
+      const fs = require("fs");
+      const port = Number.parseInt(process.env.GBRAIN_MCP_PORT || "8080", 10) || 8080;
+      fs.writeFileSync(process.argv[1], JSON.stringify({
+        client_id: process.env.GBRAIN_CLIENT_ID,
+        client_secret: process.env.GBRAIN_CLIENT_SECRET,
+        port,
+      }) + "\n");
+    ' "$GBRAIN_READ_CFG" )
+  chown root:openclaw "$GBRAIN_READ_CFG"
+  chmod 0640 "$GBRAIN_READ_CFG"
+  echo "[gbrain] wrote read-only engine credential to $GBRAIN_READ_CFG (port ${GBRAIN_MCP_PORT:-8080})"
+else
+  rm -f "$GBRAIN_READ_CFG"
+  echo "========================================================================" >&2
+  echo "[gbrain] WARNING: GBRAIN_CLIENT_ID and/or GBRAIN_CLIENT_SECRET is not set." >&2
+  echo "[gbrain] No read credential written; every 'gbrain <read>' will fail with" >&2
+  echo "[gbrain] GBRAIN_READ_CONFIG_MISSING until both are set on this service." >&2
+  echo "========================================================================" >&2
+fi
 
 # --- Git auth for non-interactive clone/push --------------------------------
 # The Railway service injects S2_GITHUB_TOKEN, but the docs/tooling historically
