@@ -1,9 +1,9 @@
 # Stage 1: Cache Playwright + Chromium download (separate layer, not re-downloaded on redeploy)
-FROM node:22-bookworm AS playwright-cache
+FROM node:22.23.4-bookworm AS playwright-cache
 RUN npx --yes playwright@latest install --with-deps chromium
 
 # Stage 2: Full OpenClaw container (based on upstream template)
-FROM node:22-bookworm
+FROM node:22.23.4-bookworm
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
