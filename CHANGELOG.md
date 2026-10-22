@@ -4,6 +4,12 @@ Running session history for the OpenClaw worker wrapper. Append new entries at t
 
 ---
 
+## 2026-10-22 — Node.js October 2026 security release
+
+Pinned the image to `node:22.23.4-bookworm` (both stages), the patched 22 LTS (CVE-2026-111497 Brotli RCE + 9 others). It was `node:22-bookworm`, which floated to whatever patch existed at build time. Kept line 22 — prod has run 22 since 7505df6. `.mise.toml` (was 24) and `engines` (was `>=24`) now name the same version prod runs. Verified locally on 22.23.4: `npm run lint` and `npm run check:gate` (all checks passed). Docker image not built locally; the `docker-build` workflow builds it on the PR.
+
+---
+
 ## Overnight consolidation — spec-kit + kb-image-import (P3)
 
 **P3B — kb-image-import is already gone; stale Dockerfile reference removed.** The retired `kb-image-import` skill has no presence in this repo (no `src/skills/` tree; grepped clean). `entrypoint.sh` already actively prunes any copy a persistent volume carried from an old boot — `rm -rf "$WORKSPACE_DIR/skills/kb-image-import"` (line ~285) and strips the `<!-- s2:kb-image-import -->` block from `WORKFLOWS.md` (lines ~286-294). That cleanup stays. The only residue was a misleading Dockerfile comment (lines 67-68) pointing at a non-existent `src/skills/kb-image-import/run.js` — replaced with an accurate note. Comment-only change; no build impact.
